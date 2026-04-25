@@ -1,0 +1,104 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# Data files (keep structure, ignore large data)
+data/raw/*.csv
+data/processed/
+*.pickle
+*.pkl
+
+# Model checkpoints and artifacts
+*.pth
+*.pt
+*.ckpt
+checkpoints/
+model_saves/
+
+# Results and logs
+results/*.csv
+logs/
+*.log
+wandb/
+lightning_logs/
+
+# LaTeX build artifacts
+RNAD_PAPER/*.aux
+RNAD_PAPER/*.bbl
+RNAD_PAPER/*.blg
+RNAD_PAPER/*.fdb_latexmk
+RNAD_PAPER/*.fls
+RNAD_PAPER/*.log
+RNAD_PAPER/*.out
+RNAD_PAPER/*.pdf
+RNAD_PAPER/*.toc
+RNAD_PAPER/*.lof
+RNAD_PAPER/*.lot
+RNAD_PAPER/texput.log
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*~
+
+# OS specific
+Thumbs.db
+.DS_Store
+
+# Environment variables
+.env
+.env.local
+
+# Cache
+.cache/
+*.cache
+
+# Matplotlib
+.matplotlibrc

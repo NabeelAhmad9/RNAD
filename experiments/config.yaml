@@ -1,0 +1,118 @@
+dataset:
+  path: data/raw/USDJPY.csv
+  datetime_column: datetime
+  target_column: close
+  feature_columns: [open, high, low, close, volume, macd, macd_signal, macd_hist, rsi_14, ema_9, bb_middle, bb_upper, bb_lower]
+  train_ratio: 0.80
+  val_ratio: 0.10
+  test_ratio: 0.10
+  window_size: 24
+  horizon: 1
+  processed_output_path: data/processed/USDJPY.pkl
+
+experiment:
+  models: [patchtst, itransformer, nhits, timexer]
+  losses: [mse, huber, log_cosh, gmadl, rnad]
+  seeds: [178, 956, 1045] 
+  datasets:
+    - data/raw/AAPL.csv
+    - data/raw/AUDUSD.csv
+    - data/raw/BTCUSD.csv
+    - data/raw/DAX30.csv
+    - data/raw/ETHUSD.csv
+    - data/raw/FTSE100.csv
+    - data/raw/US500.csv
+    - data/raw/USDJPY.csv
+    - data/raw/XAUUSD.csv
+
+training:
+  optimizer: adam
+  learning_rate: 0.0005
+  epochs: 50
+  batch_size: 64
+  num_workers: 0
+  device: auto
+  resume: true
+  progress_bar: true
+
+model_configs:
+  patchtst:
+    patch_len: 16
+    stride: 8
+    d_model: 128
+    n_heads: 4
+    e_layers: 3
+    d_ff: 256
+    dropout: 0.05
+    fc_dropout: 0.05
+    head_dropout: 0.0
+    revin: true
+    decomposition: false
+    target_idx: 3
+
+  itransformer:
+    d_model: 128
+    d_ff: 256
+    e_layers: 3
+    n_heads: 8
+    dropout: 0.05
+    activation: gelu
+    target_idx: 3
+
+  nhits:
+    n_stacks: 3
+    n_blocks: 2
+    n_layers: 2
+    n_hidden: 256
+    n_pool_kernel_size: [2, 2, 2]
+    n_freq_downsample: [4, 2, 1]
+    pooling_mode: max
+    interpolation_mode: linear
+    dropout: 0.05
+    activation: ReLU
+    batch_normalization: false
+    shared_weights: false
+    target_idx: 3
+
+  timexer:
+    patch_len: 8
+    d_model: 128
+    d_ff: 256
+    e_layers: 2
+    n_heads: 8
+    dropout: 0.05
+    factor: 5
+    activation: gelu
+    use_norm: true
+    target_idx: 3
+
+loss_configs:
+  huber:
+    delta: 1.0
+
+  log_cosh: {}
+
+  gmadl:
+    alpha: 0.5
+    beta: 5.0
+
+  rnad:
+    lambda_dir: 0.5
+    tail_tau: 1.1
+    tail_temp: 0.30
+    charb_eps: 0.001
+    beta: 4.5
+    kappa: 4.5
+    noise_level: 0.10
+    noise_temp: 0.04
+    vol_momentum: 0.985
+    eps: 1.0e-8
+
+reproducibility:
+  deterministic: true
+
+paths:
+  logs_dir: results/logs
+  metrics_dir: results/metrics
+  plots_dir: results/plots
+  checkpoints_dir: results/checkpoints

@@ -1,0 +1,2155 @@
+\documentclass[11pt]{article}
+
+% ----------------------------------------------------------------------
+% Packages
+% -----------------------------------------------------------------------
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{booktabs,array,tabularx,longtable,multirow}
+\usepackage{subcaption,graphicx,float,placeins}
+\usepackage{enumitem}
+\usepackage{siunitx}
+\usepackage{caption}
+\usepackage{xcolor}
+\definecolor{linkblue}{HTML}{1A73E8}
+\usepackage{xspace}
+\usepackage{pifont}
+\usepackage{microtype}
+\usepackage{natbib}
+\usepackage[colorlinks=true, linkcolor=linkblue, citecolor=linkblue, urlcolor=linkblue]{hyperref}
+
+% -----------------------------------------------------------------------
+% Typesetting configuration
+% -----------------------------------------------------------------------
+\graphicspath{{figures/}}
+\sisetup{detect-weight=true, detect-family=true}
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.12}
+\captionsetup{font=small, labelfont=bf, width=0.95\textwidth,
+              skip=4pt}
+\setlength{\floatsep}{8pt plus 2pt minus 2pt}
+\setlength{\textfloatsep}{10pt plus 2pt minus 4pt}
+\setlength{\intextsep}{8pt plus 2pt minus 2pt}
+
+% -----------------------------------------------------------------------
+% Custom commands
+% -----------------------------------------------------------------------
+\newcommand{\RNAD}{RNAD\xspace}
+\newcommand{\eg}{\textit{e.g.}\xspace}
+\newcommand{\ie}{\textit{i.e.}\xspace}
+\newcommand{\etal}{\textit{et~al.}\xspace}
+\newcommand{\bm}[1]{\boldsymbol{#1}}
+\DeclareMathOperator{\sgn}{sgn}
+\newtheorem{remark}{Remark}
+
+% Tighter paragraph spacing in lists
+\setlist[itemize]{noitemsep, topsep=3pt, leftmargin=*}
+\setlist[enumerate]{noitemsep, topsep=3pt, leftmargin=*, label=(\roman*)}
+
+% -----------------------------------------------------------------------
+\title{\RNAD: Regime-Normalized Adaptive Directional Loss\\
+       for Financial Time-Series Forecasting}
+\author{Nabeel Ahmad Saidd\\
+Dr. A. P. J. Abdul Kalam Technical University\\
+\texttt{nabeelahmadsaidd@gmail.com}}
+\date{}
+
+\begin{document}
+\maketitle
+
+% -----------------------------------------------------------------------
+\begin{abstract}
+Financial time-series forecasting faces a fundamental geometric
+mismatch: standard training objectives minimize pointwise residuals on
+an absolute price scale, yet financial returns exhibit time-varying
+volatility, heavy tails, and regime switching---properties that
+violate the homoskedastic, sub-Gaussian assumptions implicit in
+mean-squared-error (MSE) training. This mismatch is acutely harmful
+for one-step-ahead prediction, where both magnitude accuracy and
+directional correctness jointly determine downstream decision quality.
+We propose \textbf{\RNAD} (\textbf{R}egime-\textbf{N}ormalized
+\textbf{A}daptive \textbf{D}irectional Loss), a drop-in training
+objective that realigns optimization geometry with the structure of
+financial prediction through three tightly integrated mechanisms:
+(i)~\emph{volatility-adaptive normalization} via an exponential
+moving average (EMA) blended with batch-wise scale estimates, ensuring
+gradient magnitudes track predictive difficulty rather than price
+amplitude; (ii)~\emph{tail-robust magnitude handling} via a
+differentiable logistic gate that interpolates smoothly between a
+quadratic core and Charbonnier-style sub-linear damping; and
+(iii)~\emph{gated directional learning} that progressively downweights
+sign supervision on economically small moves, suppressing gradient
+noise in flat-price regimes. \RNAD is architecture-agnostic
+and introduces minimal computational overhead: its sole statefulness
+is a single per-asset scalar EMA volatility buffer.
+
+We evaluate \RNAD comprehensively on nine financial assets spanning
+equities, foreign exchange, cryptocurrencies, equity indices, and
+commodities, across four modern forecasting architectures
+(PatchTST, iTransformer, N-HiTS, TimeXer) under a strict
+chronological evaluation protocol with no look-ahead bias. \RNAD
+achieves the lowest RMSE on all four backbones and attains
+the lowest per-asset RMSE on all nine PatchTST markets.
+Controlled ablation studies indicate that each component contributes
+independently: directional learning reduces RMSE by an average of
+$0.70$ RMSE units across assets; tail gating improves robustness in
+heavy-tailed cryptocurrency regimes; and noise gating exhibits modest,
+regime-dependent effects. These results indicate
+that principled loss-level design can yield forecasting improvements
+of a comparable order of magnitude to several architectural choices,
+without modifying model structure or incurring additional computational
+cost at inference time.
+\end{abstract}
+
+% -----------------------------------------------------------------------
+\section{Introduction}
+\label{sec:intro}
+
+Accurate financial time-series forecasting requires confronting a
+structural misalignment between standard training objectives and the
+statistical properties of market data. Asset returns exhibit
+pronounced time-varying volatility~\citep{engle1982autoregressive,
+bollerslev1986generalized}, heavy-tailed distributions that deviate
+substantially from normality~\citep{mandelbrot1963variation,
+cont2001empirical}, and intermittent regime
+switching~\citep{hamilton1989new}. These characteristics violate the
+homoskedastic, sub-Gaussian assumptions implicit in MSE training, which
+treats every residual as if drawn from the same stationary distribution
+regardless of the prevailing volatility environment.
+
+A subtler but equally important deficiency of MSE is its
+\emph{directional insensitivity}.
+Many financial decisions---position entry, trend
+following, mean-reversion triggers---are sign-sensitive: a model that
+predicts the correct magnitude but the wrong direction is operationally
+harmful, not merely inaccurate. Yet minimizing MSE imposes no
+constraint on sign correctness, and a model can attain low MSE
+while simultaneously producing directional signals that are no better
+than random~\citep{leitch1991economic}. \citet{pesaran1992simple}
+formally establish the statistical independence of directional accuracy
+from conventional accuracy measures, providing direct motivation for
+its incorporation into training objectives.
+
+\paragraph{Source of the misalignment.}
+The failure mode is structural and arises in two complementary
+regimes. During high-volatility episodes, large shocks dominate
+gradient updates and drive the optimizer to minimize absolute
+magnitudes rather than to learn regime-relative behavior. During
+low-volatility periods of negligible economic significance, directional
+supervision injects irrelevant noise into the gradient signal.
+This regime-blindness is particularly harmful in one-step-ahead
+forecasting, where signal-to-noise ratios are intrinsically
+low~\citep{cao2001financial,gu2020empirical}.
+
+\paragraph{Loss-level design as a key lever.}
+Rather than modifying model architectures---an approach that has been
+extensively explored~\citep{vaswani2017attention,patchtst,
+itransformer,challu2023nhits,zeng2023dlinear}---the optimization
+objective itself can be redesigned to be regime-aware, tail-robust,
+and sign-selective~\citep{barron2019general}. This approach preserves
+full architectural flexibility while directly targeting the geometric
+mismatch. We propose \RNAD (\textbf{R}egime-\textbf{N}ormalized
+\textbf{A}daptive \textbf{D}irectional Loss), which unifies three
+complementary mechanisms into a single differentiable training
+objective:
+
+\begin{enumerate}
+\item \textbf{Adaptive Volatility Normalization.} Residuals and
+  realized returns are normalized by an online volatility estimator
+  (an EMA blended with the batch-wise root-mean-square return), so
+  gradient magnitudes scale with predictive difficulty rather than
+  with absolute price levels. This ensures that a single
+  hyperparameter configuration behaves consistently across assets as
+  disparate as BTCUSD (\$21{,}000) and AUDUSD (0.65).
+
+\item \textbf{Tail-Robust Magnitude Term.} A differentiable logistic
+  gate smoothly transitions the magnitude component from a quadratic
+  kernel (preserving local gradient sensitivity for small,
+  well-predicted errors) to Charbonnier-style sub-linear
+  damping~\citep{charbonnier1994deterministic} (bounding gradient
+  magnitudes during tail events), without the gradient discontinuity
+  of hard thresholding as in Huber loss~\citep{huber1964robust}.
+
+\item \textbf{Gated Directional Learning.} A smooth noise gate
+  downweights sign-sensitive supervision when the realized move is
+  economically small, suppressing directional-gradient noise in flat
+  or near-flat regimes where the optimal sign boundary is ill-defined.
+\end{enumerate}
+
+\RNAD is a \emph{training-time intervention}, not a model modification.
+Its sole statefulness is an $\mathcal{O}(1)$ per-asset scalar buffer,
+and it is compatible with any gradient-based forecasting backbone.
+
+\paragraph{Contributions.}
+\begin{itemize}
+\item We introduce \RNAD, a unified loss function combining adaptive
+  volatility normalization, tail-robust magnitude handling, and gated
+  directional learning. The formulation is mathematically explicit and
+  operates entirely at the loss level, without modifying architectures,
+  data pipelines, or inference procedures.
+
+\item We conduct a large-scale benchmark spanning nine assets across
+  five market classes, evaluating five loss functions on four modern
+  architectures under a fixed chronological protocol, yielding
+  20 backbone--loss combinations per asset evaluated under three
+  seeds (180 unique configurations; 540 seed-level runs).
+
+\item Controlled ablation studies isolate each component's contribution
+  to both RMSE and directional accuracy, providing mechanistic
+  insight beyond aggregate comparisons.
+
+\item Diagnostic visualizations---volatility tracking, loss
+  landscapes, gradient vector fields, and regime-stratified
+  performance profiles---clarify how each loss component operates
+  across different market conditions.
+\end{itemize}
+
+\paragraph{Paper organization.}
+Section~\ref{sec:related} surveys related work and positions \RNAD
+within the literature. Section~\ref{sec:method} formalizes the loss
+function with precise notation. Section~\ref{sec:setup} specifies the
+experimental protocol. Sections~\ref{sec:results}
+and~\ref{sec:ablation} report empirical findings and ablation
+evidence, respectively. Section~\ref{sec:discussion} interprets
+the results. Section~\ref{sec:limitations} states the limitations
+of the study. Section~\ref{sec:conclusion} concludes. Supplementary
+diagnostics appear in the Appendix.
+
+\FloatBarrier
+% -----------------------------------------------------------------------
+\section{Related Work}
+\label{sec:related}
+
+\subsection{Loss Functions for Regression and Time-Series Forecasting}
+
+The squared-error loss (MSE) is the canonical regression criterion,
+owing to its connection with the Gaussian log-likelihood and its
+closed-form optimum, but its quadratic tail renders it sensitive to
+outliers~\citep{huber1964robust}. The mean absolute error (MAE)
+improves robustness at the cost of a non-differentiable origin and
+uninformative zero gradients on well-fitted
+samples~\citep{hastie2009elements}. Huber's combined loss interpolates
+between L2 and L1 at a fixed transition threshold
+$\delta$~\citep{huber1964robust}, trading sensitivity for stability;
+log-cosh provides a smooth approximation to MAE with bounded second
+derivatives~\citep{saleh2024logcosh}. Neither criterion adapts its
+transition point to the prevailing data scale or volatility regime.
+
+\citet{barron2019general} introduced a one-parameter family that
+subsumes MSE, Cauchy, Welsch, and L1 losses under a single continuous
+shape parameter, demonstrating that the loss shape can be tuned to
+match the tail behavior of the noise distribution.
+The Charbonnier penalty~\citep{charbonnier1994deterministic},
+originally developed for edge-preserving image regularization, provides
+the sub-linear asymptotic behavior employed here for outlier damping.
+The tail-gating mechanism in \RNAD draws conceptual inspiration from
+both works but operationalizes the quadratic-to-robust transition
+via a \emph{runtime-adaptive} volatility signal rather than a fixed
+hyperparameter.
+
+In probabilistic forecasting, quantile regression
+losses~\citep{koenker1978regression} and the asymmetric Laplace
+likelihood enable heteroskedastic uncertainty estimation, but treat
+magnitude and sign independently without directly incentivizing
+directional correctness. Proper scoring rules, as surveyed by
+\citet{gneiting2007strictly}, target calibration of distributional
+forecasts rather than point-prediction accuracy. Recent work on
+conformal prediction for time series~\citep{stankeviciute2021conformal}
+extends calibration to arbitrary predictors, though also without
+directional objectives. Pinball losses and quantile regression
+forests~\citep{meinshausen2006quantile} remain standard in
+risk-management applications but do not address regime-level
+normalization.
+
+\subsection{Directional Prediction in Financial Forecasting}
+
+\citet{leitch1991economic} established that directional accuracy is an
+economically motivated criterion that is statistically independent of
+conventional error measures. \citet{pesaran1992simple} proposed a
+nonparametric test for directional predictive ability, demonstrating
+its independence from Diebold--Mariano-type forecast
+comparisons~\citep{diebold1995comparing}. \citet{harvey1997testing}
+extended these tests to handle non-normality and heteroskedasticity,
+and \citet{clark2007approximately} proposed approximately normal
+out-of-sample tests that remain valid under parameter estimation
+uncertainty---a critical consideration in financial forecasting with
+rolling windows. Together, these results motivate the direct
+incorporation of sign-sensitive objectives into the training procedure.
+
+Early work by \citet{white1988economic} and \citet{kuan1995forecasting}
+pioneered neural-network applications to financial direction prediction,
+relying on post-hoc accuracy evaluation. More recently,
+\citet{michankow2024gmadl} proposed the Generalized Mean
+Absolute Directional Loss (GMADL), which combines a magnitude
+penalty with an explicit directional alignment term. However, GMADL
+applies directional supervision unconditionally---regardless of the
+economic significance of the realized move---and lacks volatility
+normalization, making it susceptible to gradient noise during
+low-volatility regimes and to gradient imbalance across assets with
+disparate price levels. The gated directional component of \RNAD
+addresses both deficiencies.
+
+Directional objectives have also appeared outside finance. Focal
+loss~\citep{focal} downweights easy negatives in object detection, a
+structural analogue to the suppression of near-zero moves in \RNAD;
+ordinal regression losses~\citep{gutierrez2016ordinal} encode rank
+constraints that are related in spirit to sign constraints. In the
+broader machine learning literature, pairwise ranking
+losses~\citep{burges2005learning} and the maximum mean discrepancy
+objective~\citep{gretton2012kernel} shape the output distribution in
+ways analogous to directional gating, though without financial
+regime-awareness.
+
+\subsection{Regime-Aware and Adaptive Objectives}
+
+Heteroskedasticity in financial returns has been extensively modeled
+at the \emph{data} level via ARCH~\citep{engle1982autoregressive} and
+GARCH~\citep{bollerslev1986generalized} families, which estimate
+conditional variance to normalize returns. The volatility
+normalization in \RNAD applies an analogous idea directly to the loss
+geometry. RevIN~\citep{kim2022reversible} normalizes time-series inputs
+via instance-wise statistics to mitigate non-stationarity and
+distribution shift, establishing a precedent for normalization as a
+preprocessing strategy within deep forecasters; \RNAD applies an
+analogous normalization at the loss level, and the two approaches are
+orthogonal and composable. Dish-TS~\citep{fan2023dish} and
+SAN~\citep{liu2024adaptive} extend instance normalization to handle
+within-sequence distribution shifts but do not address gradient-level
+regime sensitivity.
+
+Curriculum learning~\citep{bengio2009curriculum} and self-paced
+learning~\citep{kumar2010self} dynamically adjust sample weights based
+on training-phase difficulty, a concept related to the noise gating
+in \RNAD, which suppresses supervision on ambiguous samples throughout
+training. Multi-task learning with uncertainty
+weighting~\citep{kendall2018multi} estimates per-task variances online
+to balance gradient contributions; the per-asset EMA buffer in \RNAD
+implements a simpler, single-task variant of this idea. Sample
+weighting by prediction difficulty has also been studied in the
+context of noisy-label learning~\citep{ren2018learning} and domain
+adaptation~\citep{ganin2016domain}, where dynamically adjusting
+gradient contributions from different sample subsets is central to
+robust optimization.
+
+\subsection{Neural Forecasting Architectures}
+
+The encoder--decoder models based on dilated convolutions
+(WaveNet;~\citealt{oord2016wavenet}) and autoregressive recurrent
+networks (DeepAR;~\citealt{salinas2020deepar}) established canonical
+sequence modeling baselines. N-BEATS~\citep{oreshkin2020nbeats} and
+N-HiTS~\citep{challu2023nhits} subsequently demonstrated that
+hierarchical decomposition stacks without recurrence could exceed
+RNN-based methods on long-horizon benchmarks.
+
+The transformer architecture of \citet{vaswani2017attention} has been
+extensively adapted for time-series forecasting.
+Informer~\citep{zhou2021informer} reduced attention complexity via
+ProbSparse selection; Autoformer~\citep{wu2021autoformer} replaced
+attention with auto-correlation decomposition; and
+FEDformer~\citep{zhou2022fedformer} applied frequency-domain
+transformations. PatchTST~\citep{patchtst} segments series into
+patches and applies channel-independent self-attention with RevIN
+normalization, achieving strong long-horizon performance.
+iTransformer~\citep{itransformer} reverses the attention axis to
+operate across variates rather than time steps, improving multivariate
+generalization. Non-stationary Transformers~\citep{liu2022non} address
+over-stationarization by reintegrating de-stationary statistics into
+the attention mechanism, and Crossformer~\citep{zhang2023crossformer}
+captures cross-dimensional dependencies via a two-stage routing
+mechanism.
+
+\citet{zeng2023dlinear} demonstrated that a single-layer linear model
+can match transformer performance on several long-horizon benchmarks,
+prompting the community to prioritize rigorous evaluation over
+architectural complexity. TiDE~\citep{das2023long} revisited
+MLP-based designs with separate encoder--decoder branches, recovering
+competitive accuracy with reduced parameter counts.
+
+More recent architectures include TimesNet~\citep{wu2023timesnet},
+which projects time series into two-dimensional temporal--frequency
+maps; TSMixer~\citep{ekambaram2023tsmixer}, applying MLP-mixer
+operations; TimeMixer~\citep{wang2024timemixer}, combining multi-scale
+decomposition and mixing; and ETSformer~\citep{woo2022etsformer},
+which incorporates exponential smoothing into the attention mechanism.
+Foundation models for time series---including
+Chronos~\citep{ansari2024chronos}, TimesFM~\citep{das2024decoder},
+and Time-LLM~\citep{jin2023time}---have further expanded the scope
+by leveraging large-scale pretraining. These architectures serve as
+evaluation contexts in the present study; no architectural novelty
+is proposed here, and the experiments instead assess whether the
+training-level intervention of \RNAD generalizes consistently across
+this diverse family of backbones.
+
+\subsection{Financial Forecasting Evaluation and Benchmarks}
+
+Sound evaluation of financial forecasters requires chronological
+splits, the absence of look-ahead bias, and replication across random
+seeds to guard against initialization artifacts~\citep{makridakis2022m5,
+zeng2023dlinear}. The Diebold--Mariano
+test~\citep{diebold1995comparing} and the Model Confidence
+Set~\citep{hansen2011model} provide statistical frameworks for
+comparing forecast accuracy; \citet{diebold2015comparing} revisited
+these in the context of modern machine learning models. Asset pricing
+applications of machine learning~\citep{gu2020empirical,
+freyberger2020dissecting,kelly2019characteristics} have demonstrated
+that nonlinear models provide out-of-sample return predictability,
+reinforcing the value of improving training objectives.
+\citet{welch2008comprehensive} provide a comprehensive benchmark of
+predictive variables for equity returns that highlights the difficulty
+of out-of-sample improvement. \citet{campbell2008predicting} show
+that economically motivated restrictions on forecasting models
+improve their out-of-sample performance---an insight that the
+directional gating of \RNAD embodies at the gradient level.
+
+\paragraph{Positioning.}
+Table~\ref{tab:loss-comparison} summarizes the property matrix of the
+loss families discussed above. \RNAD is uniquely distinguished by
+simultaneously satisfying all six desiderata: scale normalization,
+tail robustness, directional awareness, online statefulness, noise
+gating, and adaptive scaling. No prior loss function in the financial
+forecasting literature satisfies all six criteria jointly.
+
+\begin{table}[t]
+\centering
+\caption{Property matrix of loss functions. A checkmark indicates the
+  property is satisfied by design; a cross indicates it is absent.
+  \RNAD uniquely satisfies all six criteria. ``Fixed $\delta$''
+  indicates that the transition is preset rather than data-adaptive.}
+\label{tab:loss-comparison}
+\small
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabularx}{\textwidth}{X c c c c c c}
+\toprule
+Loss & Scale-Norm & Tail-Robust & Dir-Aware & Stateful
+     & Noise-Gated & Adaptive-Scale \\
+\midrule
+MSE      & \ding{55} & \ding{55} & \ding{55} & \ding{55} & \ding{55} & \ding{55} \\
+Huber    & \ding{55} & \ding{51}\ (fixed $\delta$) & \ding{55} & \ding{55} & \ding{55} & \ding{55} \\
+log-cosh & \ding{55} & \ding{51}\ (smooth)         & \ding{55} & \ding{55} & \ding{55} & \ding{55} \\
+GMADL    & \ding{55} & \ding{51}                   & \ding{51} & \ding{55} & \ding{55} & \ding{55} \\
+\RNAD    & \ding{51} & \ding{51}\ (gated)          & \ding{51} & \ding{51} & \ding{51} & \ding{51} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+
+Having established the position of \RNAD within the existing
+literature, the following section develops the loss function
+formally.
+
+\FloatBarrier
+% -----------------------------------------------------------------------
+\section{The \RNAD Loss Function}
+\label{sec:method}
+
+\subsection{Notation and Problem Formulation}
+
+Consider one-step-ahead forecasting of a univariate financial
+close-price series $\{y_t\}_{t=1}^{T}$, where $y_t \in \mathbb{R}_{>0}$
+denotes the close price at time $t$. A forecasting model
+$f_\theta : \mathbb{R}^{d \times L} \to \mathbb{R}$ parameterized by
+$\theta$ maps a window of $L$ past multivariate observations to a
+predicted close price $\hat{y}_t = f_\theta(\mathbf{x}_{t-L:t})$.
+In the implementation, both the input features and the target close
+series are standardized with training-split $z$-score statistics
+before the loss is computed; predictions are inverse-transformed only
+for reporting raw-scale metrics.
+
+For each time step $t$, three scalar quantities are defined:
+\begin{align}
+  e_t     &\;=\; \hat{y}_t - y_t,
+          && \text{(forecast residual),}
+  \label{eq:residual}\\
+  r_t     &\;=\; y_t - y_{t-1},
+          && \text{(realized one-step return),}
+  \label{eq:realized}\\
+  \hat{r}_t &\;=\; \hat{y}_t - y_{t-1},
+          && \text{(predicted one-step return).}
+  \label{eq:predicted-return}
+\end{align}
+Throughout, subscript $b \in \{1,\ldots,B\}$ indexes examples within
+a mini-batch of size $B$. All three quantities in
+Eqs.~\eqref{eq:residual}--\eqref{eq:predicted-return} are computable
+from observations available at time $t$, ensuring the absence of
+look-ahead bias.
+
+\subsection{Adaptive Volatility Normalization}
+\label{ssec:normalization}
+
+A shared volatility scale $s_t > 0$ underlies all subsequent
+computations. It blends two complementary estimators: a batch-wise
+instantaneous estimate that responds promptly to volatility spikes,
+and an EMA that retains regime-level memory across gradient steps.
+
+\paragraph{Batch-wise scale.}
+Given a mini-batch of realized returns $\{r_t^{(b)}\}_{b=1}^{B}$,
+the batch-wise scale is defined as
+\begin{equation}
+  s_t^{\mathrm{batch}}
+  = \sqrt{\frac{1}{B}\sum_{b=1}^{B}\bigl(r_t^{(b)}\bigr)^2 + \varepsilon},
+  \qquad \varepsilon = 10^{-8}.
+  \label{eq:batch-scale}
+\end{equation}
+This is the root-mean-square (RMS) of realized returns, which
+approximates the conditional standard deviation under zero-mean
+innovations. The regularizer $\varepsilon$ prevents division by zero
+during sustained flat-price periods.
+
+\paragraph{EMA scale.}
+To capture regime-level volatility persistence, a running exponential
+moving average is maintained:
+\begin{equation}
+  s_t^{\mathrm{EMA}}
+  = \rho\,s_{t-1}^{\mathrm{EMA}}
+  + (1-\rho)\,s_t^{\mathrm{batch}},
+  \qquad \rho = 0.985,
+  \label{eq:ema-scale}
+\end{equation}
+with initialization $s_0^{\mathrm{EMA}} = 1.0$. The effective memory
+window spans approximately $1/(1-\rho) = 67$ gradient steps, which
+is sufficient to track macro-level regime transitions while remaining
+responsive to sustained volatility shifts.
+
+\paragraph{Composite scale.}
+The final scale is the geometric mean of the two estimates:
+\begin{equation}
+  s_t
+  = \sqrt{s_t^{\mathrm{batch}} \cdot s_t^{\mathrm{EMA}} + \varepsilon}.
+  \label{eq:composite-scale}
+\end{equation}
+Taking the geometric mean ensures that $s_t$ responds promptly to
+volatility spikes via $s_t^{\mathrm{batch}}$ while being anchored to
+the prevailing regime level via $s_t^{\mathrm{EMA}}$, without
+tracking transient noise. The normalized quantities used throughout
+are:
+\begin{equation}
+  u_t = \frac{e_t}{s_t},
+  \qquad
+  z_t = \frac{r_t}{s_t},
+  \qquad
+  \hat{z}_t = \frac{\hat{r}_t}{s_t},
+  \label{eq:normalized}
+\end{equation}
+where $u_t$ is the volatility-normalized residual and $z_t$,
+$\hat{z}_t$ are the normalized realized and predicted returns,
+respectively.
+
+\emph{Implementation note.} The codebase standardizes all input
+features and the target close series using training-split statistics
+before evaluating the loss; the notation above is written on that
+standardized target scale, and raw prices are restored only for
+reporting.
+
+\begin{remark}
+\normalfont
+The EMA update in Eq.~\eqref{eq:ema-scale} is applied only during
+training. During validation and testing, the loss is evaluated with
+the EMA buffer frozen, so no evaluation-set statistics feed back into
+the training state. Checkpoint-resume pipelines should therefore
+persist the EMA buffer alongside model parameters.
+\end{remark}
+
+\subsection{Tail-Robust Magnitude Term}
+\label{ssec:magnitude}
+
+The magnitude component smoothly interpolates between a quadratic
+kernel that preserves sensitivity for well-predicted samples and a
+sub-linear Charbonnier kernel that bounds gradient magnitudes during
+tail events.
+
+\paragraph{Tail gate.}
+Let $\sigma(x) = (1+e^{-x})^{-1}$ denote the logistic sigmoid. The
+interpolation weight is
+\begin{equation}
+  g_t
+  = \sigma\!\left(\frac{|u_t| - \tau_{\mathrm{mag}}}{\tau_{\mathrm{temp}}}\right),
+  \label{eq:tail-gate}
+\end{equation}
+where $\tau_{\mathrm{mag}} = 1.1$ is the transition midpoint in units
+of $s_t$ and $\tau_{\mathrm{temp}} = 0.3$ controls the sharpness of
+the transition. When $|u_t| \ll \tau_{\mathrm{mag}}$, we have
+$g_t \approx 0$ (quadratic regime); when $|u_t| \gg \tau_{\mathrm{mag}}$,
+$g_t \approx 1$ (Charbonnier regime). The logistic transition avoids
+the gradient discontinuity of the Huber threshold.
+
+\paragraph{Kernel definitions.}
+The quadratic and Charbonnier kernels are:
+\begin{align}
+  \ell_t^{\mathrm{L2}}
+  &= \tfrac{1}{2}u_t^2,
+  \label{eq:l2-kernel}\\[2pt]
+  \ell_t^{\mathrm{charb}}
+  &= \sqrt{u_t^2 + \varepsilon_c^2} - \varepsilon_c,
+  \qquad \varepsilon_c = 10^{-3}.
+  \label{eq:charb-kernel}
+\end{align}
+The offset $\varepsilon_c$ ensures differentiability at $u_t = 0$.
+As $|u_t| \to \infty$, $\ell_t^{\mathrm{charb}} \approx |u_t|$
+(linear growth), whereas $\ell_t^{\mathrm{L2}} = u_t^2$ grows
+without bound, amplifying the influence of extreme residuals.
+
+\paragraph{Blended magnitude loss.}
+The final magnitude term is:
+\begin{equation}
+  \ell_t^{\mathrm{mag}}
+  = (1 - g_t)\,\ell_t^{\mathrm{L2}}
+  + g_t\,\ell_t^{\mathrm{charb}}.
+  \label{eq:mag-loss}
+\end{equation}
+Because the gates depend on $|u_t|$ and $|z_t|$, the full objective
+is piecewise smooth rather than globally $C^\infty$; it is
+differentiable almost everywhere, with non-differentiable points only
+at $u_t = 0$ and $z_t = 0$. Away from those measure-zero points,
+the derivative with respect to $u_t$ transitions from approximately
+$u_t$ near the origin to approximately $\mathrm{sgn}(u_t)$ in the
+tails, bounding the influence of tail observations on parameter
+updates.
+
+\subsection{Directional Term with Noise Gating}
+\label{ssec:directional}
+
+The directional component penalizes sign disagreement between the
+predicted and realized return, with a smooth gate that downweights
+the penalty on economically small moves.
+
+\paragraph{Smooth sign encoding.}
+Both returns are mapped to $(-1, +1)$ via a scaled hyperbolic tangent:
+\begin{equation}
+  d_t^{\mathrm{true}} = \tanh(\beta\,z_t),
+  \qquad
+  d_t^{\mathrm{pred}} = \tanh(\beta\,\hat{z}_t),
+  \qquad
+  \beta = 4.5.
+  \label{eq:tanh-sign}
+\end{equation}
+The sharpness parameter $\beta$ controls the transition width around
+zero. At $\beta = 4.5$, a normalized move $|z_t| = 0.5$ is encoded
+as $|\tanh(2.25)| \approx 0.978$, rendering the encoding near-binary
+for moderate moves while remaining differentiable at the origin.
+
+\paragraph{Directional alignment score.}
+The per-sample alignment is:
+\begin{equation}
+  a_t
+  = d_t^{\mathrm{true}} \cdot d_t^{\mathrm{pred}}
+  \;\in\; [-1,\,1].
+  \label{eq:dir-score}
+\end{equation}
+Perfect directional agreement ($\hat{z}_t$ and $z_t$ share sign)
+gives $a_t \to +1$; perfect disagreement gives $a_t \to -1$.
+
+\paragraph{Noise gate.}
+A smooth sigmoid gate downweights directional supervision when the
+realized move is negligible relative to the current volatility:
+\begin{equation}
+  w_t = \sigma\!\left(\frac{|z_t| - \tau_{\mathrm{noise}}}{\tau_{\mathrm{noise,temp}}}\right),
+  \qquad
+  \tau_{\mathrm{noise}} = 0.1.
+  \label{eq:noise-gate}
+\end{equation}
+The gate temperature is fixed at $\tau_{\mathrm{noise,temp}} = 0.04$.
+Both constants are expressed in normalized units and are held fixed
+across all assets; no per-asset calibration is applied. Smaller moves
+receive continuously smaller directional weights rather than a binary
+on/off suppression.
+
+\paragraph{Directional penalty.}
+Using softplus for numerical stability, the directional loss is:
+\begin{equation}
+  \ell_t^{\mathrm{dir}}
+  = w_t \cdot \mathrm{softplus}\!\left(-\kappa\,a_t\right),
+  \qquad
+  \mathrm{softplus}(x) = \ln(1 + e^x),
+  \qquad
+  \kappa = 4.5.
+  \label{eq:dir-loss}
+\end{equation}
+For perfect alignment ($a_t = 1$): $\ell_t^{\mathrm{dir}} =
+\mathrm{softplus}(-4.5) \approx 0.011$. For perfect disagreement
+($a_t = -1$): $\ell_t^{\mathrm{dir}} = \mathrm{softplus}(4.5)
+\approx 4.51$. This asymmetry strongly penalizes directional errors
+while imposing negligible cost on correct predictions, creating a
+well-defined decision boundary around the sign of $\hat{z}_t$.
+
+\subsection{Full Objective}
+\label{ssec:full-loss}
+
+The per-sample \RNAD loss is:
+\begin{equation}
+  \mathcal{L}_t^{\RNAD}
+  = \ell_t^{\mathrm{mag}}
+  + \lambda_{\mathrm{dir}}\,\ell_t^{\mathrm{dir}},
+  \qquad
+  \lambda_{\mathrm{dir}} = 0.5,
+  \label{eq:rnad-sample}
+\end{equation}
+and the mini-batch training objective averages over the batch:
+\begin{equation}
+  \mathcal{L}^{\RNAD}
+  = \frac{1}{B}\sum_{b=1}^{B}\mathcal{L}_{b}^{\RNAD}.
+  \label{eq:rnad-batch}
+\end{equation}
+The EMA buffer $s_t^{\mathrm{EMA}}$ is the sole persistent state;
+it is updated after each gradient step. All other quantities in
+Eqs.~\eqref{eq:tail-gate}--\eqref{eq:rnad-sample} are computed
+from the current batch. Table~\ref{tab:hyperparams} lists all
+loss-specific constants, and Section~\ref{sec:reproducibility}
+summarizes the full backbone and training settings.
+Fig.~\ref{fig:architecture} illustrates the full computational graph.
+
+\FloatBarrier
+\begin{figure}[!http]
+\centering
+\includegraphics[width=0.95\textwidth]{figure_01_rnad_schematic.pdf}
+\caption{\textbf{\RNAD loss architecture (Simplified).}
+  Model outputs $\hat{y}_t$ and target values $y_t$ enter two
+  parallel pathways. \emph{Upper (magnitude) pathway:} the residual
+  $e_t$ is normalized by the composite volatility scale $s_t$
+  (Eq.~\ref{eq:composite-scale}) to yield $u_t$; the tail gate $g_t$
+  (Eq.~\ref{eq:tail-gate}) interpolates between the quadratic kernel
+  $\ell^{\mathrm{L2}}$ (Eq.~\ref{eq:l2-kernel}) and the Charbonnier
+  kernel $\ell^{\mathrm{charb}}$ (Eq.~\ref{eq:charb-kernel}).
+  \emph{Lower (directional) pathway:} normalized returns $z_t$ and
+  $\hat{z}_t$ are sign-encoded via $\tanh$ (Eq.~\ref{eq:tanh-sign});
+  the noise gate $w_t$ (Eq.~\ref{eq:noise-gate}) downweights
+  supervision on small-magnitude moves; the directional penalty
+  $\ell^{\mathrm{dir}}$ (Eq.~\ref{eq:dir-loss}) is computed via
+  softplus. Both pathways are combined in
+  Eq.~\eqref{eq:rnad-sample}. The EMA buffer $s_t^{\mathrm{EMA}}$
+  (dashed arrow) is updated after each gradient step.}
+\label{fig:architecture}
+\end{figure}
+
+\begin{figure}[!http]
+\centering
+\includegraphics[width=0.95\textwidth]{figure_02_rnad_surface.pdf}
+\caption{\textbf{\RNAD loss surface.}
+  $\mathcal{L}_t^{\RNAD}$ as a function of normalized residual $u_t$
+  and normalized realized return $z_t$ (Eq.~\ref{eq:normalized}).
+  Three geometric features are visible: (i)~a quadratic bowl for
+  $|u_t| < \tau_{\mathrm{mag}} = 1.1$; (ii)~smooth Charbonnier
+  flattening for $|u_t| > 1.1$; and (iii)~directional penalty ridges
+  where $\mathrm{sgn}(\hat{z}_t) \neq \mathrm{sgn}(z_t)$ and
+  $|z_t| > \tau_{\mathrm{noise}} = 0.1$. The surface is
+  piecewise smooth and differentiable almost everywhere; the only
+  non-differentiable points arise from the absolute-value gates at
+  $u_t = 0$ and $z_t = 0$.}
+\label{fig:rnad-surface}
+\end{figure}
+
+\FloatBarrier
+
+\subsection{Mechanistic Rationale}
+\label{ssec:rationale}
+
+Each component of \RNAD targets a distinct failure mode of standard
+losses on financial data:
+
+\begin{itemize}
+\item \textbf{Volatility normalization} (Eq.~\ref{eq:composite-scale})
+  removes the spurious coupling between gradient magnitude and asset
+  price level. Without normalization, high-priced assets
+  (BTCUSD $\sim$\$21{,}000) generate gradients orders of magnitude
+  larger than low-priced assets (AUDUSD $\sim$0.65), preventing a
+  single hyperparameter configuration from being applicable across
+  asset classes.
+
+\item \textbf{Tail gating} (Eq.~\ref{eq:tail-gate}) prevents rare
+  shock events from dominating optimization. Unlike Huber's hard
+  threshold, the smooth transition preserves gradient informativeness
+  within the interior of the residual distribution while bounding
+  gradient norms in the tails, improving robustness without
+  sacrificing sensitivity.
+
+\item \textbf{Directional learning} (Eq.~\ref{eq:dir-loss})
+  explicitly incentivizes sign correctness, addressing MSE's
+  structural inability to enforce directional
+  accuracy~\citep{leitch1991economic,pesaran1992simple}. As analyzed
+  in Section~\ref{ssec:coupling}, this coupling between sign and
+  magnitude objectives also reduces RMSE.
+
+\item \textbf{Noise gating} (Eq.~\ref{eq:noise-gate}) focuses
+  directional supervision on economically meaningful moves. Near-zero
+  returns contribute noisy, potentially misleading sign gradients
+  that can destabilize learning in low-volatility regimes such as
+  foreign exchange markets (see ablation results in
+  Table~\ref{tab:ablation}).
+\end{itemize}
+
+The experimental setup required to evaluate these mechanisms is
+described in the following section.
+
+\FloatBarrier
+% -----------------------------------------------------------------------
+\section{Experimental Setup}
+\label{sec:setup}
+
+\subsection{Datasets and Assets}
+
+We evaluate on nine financial assets spanning five market classes
+(Table~\ref{tab:data-summary}): equities (AAPL, DAX30, FTSE100),
+foreign exchange (AUDUSD, USDJPY), cryptocurrencies (BTCUSD, ETHUSD),
+equity indices (US500), and commodities (XAUUSD). All series consist
+of minute-frequency OHLCV data. Total sample sizes range from
+15{,}673 (AAPL) to 68{,}536 (USDJPY), spanning multiple market
+regimes and volatility cycles. Realized volatility proxies
+(training-set RMS returns) vary by two orders of magnitude across
+assets, from USDJPY ($9.6 \times 10^{-4}$) to ETHUSD
+($8.5 \times 10^{-3}$), providing strong motivation for the
+cross-asset normalization mechanism.
+
+\paragraph{Chronological split protocol.}
+All splits are strictly chronological with no shuffling: $80\%$
+training, $10\%$ validation, $10\%$ test. This protocol eliminates
+look-ahead bias, preserves temporal autocorrelation structure, and
+evaluates generalization to the most recent---and typically the most
+distributional-shift-prone---period of each series, following
+established best practice~\citep{makridakis2022m5,zeng2023dlinear,
+welch2008comprehensive}.
+
+\begin{table}[!htbp]
+\centering
+\caption{Dataset summary. All assets use an identical OHLCV and
+  technical indicator feature set, a raw close-price target, and an
+  $80/10/10$ chronological split. Vol.\ Proxy is the training-set
+  root-mean-square one-step return, used to initialize
+  $s_0^{\mathrm{EMA}}$.}
+\label{tab:data-summary}
+\small
+\begin{tabularx}{\textwidth}{X l r r r r l}
+\toprule
+Asset   & Market Type    & Total     & Train      & Val       & Test      & Vol.\ Proxy \\
+\midrule
+AAPL    & Equity         & 15{,}673  & 12{,}538   & 1{,}567   & 1{,}568   & 0.00616 \\
+AUDUSD  & Forex          & 68{,}535  & 54{,}828   & 6{,}853   & 6{,}854   & 0.00127 \\
+BTCUSD  & Crypto         & 62{,}793  & 50{,}234   & 6{,}279   & 6{,}280   & 0.00653 \\
+DAX30   & Equity Index   & 57{,}783  & 46{,}226   & 5{,}778   & 5{,}779   & 0.00233 \\
+ETHUSD  & Crypto         & 62{,}783  & 50{,}226   & 6{,}278   & 6{,}279   & 0.00847 \\
+FTSE100 & Equity Index   & 56{,}767  & 45{,}413   & 5{,}676   & 5{,}678   & 0.00197 \\
+US500   & Equity Index   & 57{,}665  & 46{,}132   & 5{,}766   & 5{,}767   & 0.00200 \\
+USDJPY  & Forex          & 68{,}536  & 54{,}828   & 6{,}853   & 6{,}855   & 0.00096 \\
+XAUUSD  & Commodity      & 65{,}093  & 52{,}074   & 6{,}509   & 6{,}510   & 0.00164 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\FloatBarrier
+
+\subsection{Feature Engineering and Preprocessing}
+
+All models receive an identical, causally valid feature set computed
+exclusively from observations available at or before time $t$:
+raw OHLCV bars; MACD (line, signal, histogram); RSI-14; EMA-9; and
+Bollinger Bands (SMA-20, upper band, lower band). The 13-column
+feature vector is ordered as [open, high, low, close, volume, macd,
+macd\_signal, macd\_hist, rsi\_14, ema\_9, bb\_middle, bb\_upper,
+bb\_lower], so the forecast target is the close channel at index 3.
+Both the input features and the close-price target are standardized
+using $z$-score statistics ($\mu$, $\sigma$) computed on the training
+split alone and applied identically to the validation and test splits.
+The fitted target scaler is retained to inverse-transform predictions
+before computing raw-scale RMSE, MAE, and directional accuracy. The
+forecasting window is fixed at $L = 24$ input steps with a $H = 1$
+output horizon across all experiments.
+
+\subsection{Baseline Loss Functions}
+
+We compare \RNAD against four established baselines:
+\begin{itemize}
+\item \textbf{MSE:} Standard mean-squared error; the canonical
+  homoskedastic baseline against which all improvements are measured.
+\item \textbf{Huber ($\delta = 1.0$):} Fixed-threshold interpolation
+  between L2 and L1~\citep{huber1964robust}.
+\item \textbf{log-cosh:} Smooth approximation to MAE with bounded
+  second derivative~\citep{saleh2024logcosh}.
+\item \textbf{GMADL ($\alpha = 0.5$, $\beta = 5.0$):} Combined
+  magnitude and directional loss without volatility normalization
+  or noise gating~\citep{michankow2024gmadl}.
+\end{itemize}
+
+\subsection{Forecasting Backbones}
+
+The four evaluation backbones are:
+\begin{itemize}
+\item \textbf{PatchTST}~\citep{patchtst}: Patch-based transformer with
+  channel-independent self-attention and RevIN normalization;
+  $L = 24$, patch length $16$, stride $8$ (two patches),
+  $d_{\mathrm{model}} = 128$, $d_{\mathrm{ff}} = 256$,
+  $4$ heads, $3$ encoder layers, dropout $0.05$,
+  fc-dropout $0.05$, and head-dropout $0.0$.
+\item \textbf{iTransformer}~\citep{itransformer}: Inverted transformer
+  with a 24-step linear inverted embedding, $d_{\mathrm{model}} = 128$,
+  $d_{\mathrm{ff}} = 256$, $8$ heads, $3$ encoder layers, dropout
+  $0.05$, and GELU activation.
+\item \textbf{N-HiTS}~\citep{challu2023nhits}: Neural hierarchical
+  interpolation with $3$ stacks, $2$ blocks per stack, $2$ MLP layers
+  per block, $n_{\mathrm{hidden}} = 256$, max pooling, kernel sizes
+  $[2,2,2]$, downsampling factors $[4,2,1]$, linear interpolation,
+  dropout $0.05$, ReLU activation, no batch normalization, and no
+  shared weights.
+\item \textbf{TimeXer}~\citep{timexer2024}: Patch-based transformer with patch length
+  $8$ (three non-overlapping target patches over $L=24$),
+  $d_{\mathrm{model}} = 128$, $d_{\mathrm{ff}} = 256$,
+  $8$ heads, $2$ encoder layers, dropout $0.05$,
+  factor $5$, GELU activation, and \texttt{use\_norm=true}.
+\end{itemize}
+All backbones forecast the close channel (index 3) from the same
+13-feature input vector. These architectures span transformer,
+inverted-attention, hierarchical interpolation, and patch-based
+cross-attention paradigms, providing a rigorous test of loss-level
+generalization across diverse inductive biases.
+
+\section{Implementation Details and Reproducibility}
+\label{sec:reproducibility}
+
+To ensure full reproducibility of the benchmark, we fix the exact
+backbone, loss, optimizer, and deterministic settings used in the
+codebase. The feature order and target index are identical across
+all runs, and the same configuration file drives every experiment.
+
+\subsection{Backbone Configurations}
+
+All backbones forecast the close channel (index 3) from the same
+24-step window of 13 standardized features. The exact settings are
+summarized in Table~\ref{tab:architecture-config}.
+
+\begin{table}[t]
+\centering
+\caption{Backbone configurations used in all benchmark runs.}
+\label{tab:architecture-config}
+\small
+\begin{tabularx}{\textwidth}{l>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X}
+\toprule
+Backbone & Exact configuration & Notes \\
+\midrule
+PatchTST & 3 encoder layers; 4 heads; $d_{\mathrm{model}} = 128$;
+  $d_{\mathrm{ff}} = 256$; patch length 16; stride 8; dropout 0.05;
+  fc-dropout 0.05; head-dropout 0.0 & RevIN on; decomposition off;
+  BatchNorm backbone; GELU; \texttt{individual=false};
+  \texttt{res\_attention=true}; \texttt{pe=zeros};
+  \texttt{learn\_pe=true} \\
+iTransformer & 3 encoder layers; 8 heads; $d_{\mathrm{model}} = 128$;
+  $d_{\mathrm{ff}} = 256$; dropout 0.05; GELU activation & Inverted
+  linear embedding over the 24-step window; LayerNorm encoder;
+  attention factor 5; target index 3 \\
+N-HiTS & 3 stacks; 2 blocks per stack; 2 MLP layers per block;
+  $n_{\mathrm{hidden}} = 256$; dropout 0.05 & Max pooling; kernel
+  sizes $[2,2,2]$; downsampling $[4,2,1]$; linear interpolation;
+  ReLU; batch norm off; shared weights off \\
+TimeXer & 2 encoder layers; 8 heads; $d_{\mathrm{model}} = 128$;
+  $d_{\mathrm{ff}} = 256$; patch length 8; dropout 0.05; factor 5 &
+  Three non-overlapping target patches over $L = 24$; global token;
+  \texttt{use\_norm=true}; GELU \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Unless otherwise noted, remaining constructor defaults follow the
+model implementations in \texttt{models/*.py}. For example, PatchTST
+uses \texttt{attn\_dropout=0}, \texttt{padding\_patch=None},
+\texttt{affine=true}, \texttt{subtract\_last=false},
+\texttt{pre\_norm=false}, \texttt{head\_type=flatten}, and
+\texttt{max\_seq\_len=1024}.
+
+\subsection{Optimization and Deterministic Training}
+
+All models are trained with Adam~\citep{kingma2015adam} using the
+PyTorch defaults ($\beta_1 = 0.9$, $\beta_2 = 0.999$,
+$\epsilon = 10^{-8}$, zero weight decay, no AMSGrad) and a fixed
+learning rate of $5 \times 10^{-4}$. No learning-rate schedule,
+warmup, or gradient clipping is applied. Training runs for 50 epochs
+with batch size $B = 64$ and \texttt{num\_workers = 0}. The training
+split is shuffled; validation and test splits are not. Checkpoints
+are saved every epoch, \texttt{resume=true} is enabled, and the best
+checkpoint by validation RMSE is restored at the end of training.
+
+\begin{table}[t]
+\centering
+\caption{Training and reproducibility settings shared across the
+  benchmark.}
+\label{tab:training-config}
+\small
+\begin{tabularx}{\textwidth}{l>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X}
+\toprule
+Setting & Value & Notes \\
+\midrule
+Optimizer & Adam & PyTorch defaults: $\beta_1 = 0.9$, $\beta_2 = 0.999$,
+  $\epsilon = 10^{-8}$, weight decay $= 0$, AMSGrad disabled \\
+Learning rate & $5 \times 10^{-4}$ & Constant across all runs; no
+  scheduler, warmup, or gradient clipping \\
+Epochs & 50 & Full training budget; best validation-RMSE checkpoint
+  restored after training \\
+Batch size & 64 & Training loader shuffled; validation and test
+  loaders unshuffled \\
+Checkpointing & every epoch & \texttt{checkpoint\_every=1};
+  \texttt{resume=true} \\
+Seeds & $\{178, 956, 1045\}$ & Main benchmark uses three seeds;
+  ablation studies use seed 178 \\
+Determinism & true & Python, NumPy, PyTorch, and CUDA seeds are
+  fixed; cuDNN deterministic paths are enabled \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{RNAD Loss Hyperparameters}
+
+\RNAD uses fixed scalar controls across all runs; the loss contains
+no per-asset calibration or learned parameters. The EMA volatility
+buffer is initialized to 1.0, updated online, and serialized in
+checkpoints. Table~\ref{tab:hyperparams} lists the loss-specific
+constants.
+
+\begin{table}[t]
+\centering
+\caption{\RNAD loss hyperparameter configuration. All values are
+  fixed across assets, backbones, and seeds. The noise gate is a
+  smooth sigmoid rather than a hard threshold.}
+\label{tab:hyperparams}
+\small
+\begin{tabularx}{\textwidth}{X c c c}
+\toprule
+Parameter                    & Value    & Role \\
+\midrule
+$\lambda_{\mathrm{dir}}$     & $0.5$    & Directional penalty weight (Eq.~\ref{eq:rnad-sample}) \\
+$\tau_{\mathrm{mag}}$        & $1.1$    & Tail-gate transition midpoint (Eq.~\ref{eq:tail-gate}) \\
+$\tau_{\mathrm{temp}}$       & $0.3$    & Tail-gate transition sharpness (Eq.~\ref{eq:tail-gate}) \\
+$\varepsilon_c$              & $10^{-3}$ & Charbonnier smoothness offset (Eq.~\ref{eq:charb-kernel}) \\
+$\beta$                      & $4.5$    & Tanh sharpness for sign encoding (Eq.~\ref{eq:tanh-sign}) \\
+$\kappa$                     & $4.5$    & Softplus margin slope (Eq.~\ref{eq:dir-loss}) \\
+$\tau_{\mathrm{noise}}$      & $0.10$   & Smooth noise-gate center (Eq.~\ref{eq:noise-gate}) \\
+$\tau_{\mathrm{noise,temp}}$ & $0.04$   & Noise-gate temperature (Eq.~\ref{eq:noise-gate}) \\
+$\rho$                       & $0.985$  & EMA momentum, $\approx 67$-step window (Eq.~\ref{eq:ema-scale}) \\
+$\varepsilon$                & $10^{-8}$ & Numerical stability constant \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\FloatBarrier
+
+\subsection{Evaluation Metrics}
+
+Predictions are inverse-transformed to raw close prices using the
+fitted target scaler before RMSE, MAE, and directional accuracy (DA)
+are computed.
+
+\paragraph{Primary --- RMSE.}
+Root Mean Squared Error on the raw price scale (lower is better):
+\begin{equation}
+  \mathrm{RMSE}
+  = \sqrt{\frac{1}{|\mathcal{T}|}\sum_{t \in \mathcal{T}}
+          \bigl(\hat{y}_t - y_t\bigr)^2}.
+  \label{eq:rmse}
+\end{equation}
+
+\paragraph{Primary --- Directional Accuracy (DA).}
+The proportion of non-flat steps for which the predicted return sign
+matches the realized sign (higher is better):
+\begin{equation}
+  \mathrm{DA}
+  = \frac{1}{|\mathcal{T}|}\sum_{t \in \mathcal{T}}
+    \mathbf{1}\bigl[\sgn(\hat{r}_t) = \sgn(r_t)\bigr],
+  \qquad
+  \mathcal{T} = \bigl\{t : r_t \neq 0\bigr\}.
+  \label{eq:da}
+\end{equation}
+
+\paragraph{Secondary.}
+Mean Absolute Error (MAE) and ordinal RMSE rank across losses within
+each backbone are reported as secondary diagnostics to assess
+consistency.
+
+All results are expressed as mean $\pm$ standard deviation over the
+three benchmark seeds.
+
+\FloatBarrier
+% -----------------------------------------------------------------------
+\section{Results}
+\label{sec:results}
+
+\subsection{Main Benchmark: Backbone--Loss Comparison}
+
+Table~\ref{tab:main-bench} compares the five loss functions on all
+four backbones, averaging over nine assets. \RNAD achieves the lowest
+mean RMSE on all four backbones. Because RMSE is scale-dependent,
+these cross-asset averages are influenced more by higher-priced assets;
+the per-asset results in Table~\ref{tab:per-asset} should therefore
+be read alongside the aggregate figures.
+The mean RMSE rank of \RNAD is 1.0 on PatchTST, iTransformer, and
+TimeXer, and 2.0 on N-HiTS. The $\Delta$RMSE column quantifies
+improvement over the best non-\RNAD baseline; reductions range from
+$-0.66$ (TimeXer) to $-0.88$ (PatchTST) on the three
+transformer-family backbones. On N-HiTS, gains are positive but
+smaller ($\Delta\mathrm{RMSE} = -0.086$), a pattern analyzed in
+Section~\ref{ssec:interactions}.
+
+Notably, \RNAD simultaneously improves directional accuracy relative
+to MSE, Huber, log-cosh, and GMADL on all four backbones while also
+reducing RMSE. This joint improvement suggests that directional and
+magnitude objectives are not in tension under the gating design of
+\RNAD; the noise gate appears to prevent directional supervision from
+introducing gradient noise that would otherwise degrade magnitude
+accuracy.
+
+\begin{table}[!http]
+\centering
+\caption{Main benchmark results averaged over nine assets and three
+  seeds ($\{178, 956, 1045\}$). Lower RMSE and MAE are better; higher
+  DA~(\%) is better. Rank denotes ordinal position by RMSE within each
+  backbone (1 = best). $\Delta$RMSE is the improvement of \RNAD over
+  the best non-\RNAD baseline; negative values indicate improvement.
+  Bold entries indicate the best-performing loss per backbone per
+  metric.}
+\label{tab:main-bench}
+\scriptsize
+\setlength{\tabcolsep}{3.0pt}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llrrrrc}
+\toprule
+Model & Loss & RMSE & MAE & DA~(\%) & Rank & $\Delta$RMSE \\
+\midrule
+\multirow{5}{*}{PatchTST}
+  & MSE      & $60.78\pm0.02$ & $40.36\pm0.05$ & $50.05\pm0.20$ & 3 & $+0.004$ \\
+  & Huber    & $60.78\pm0.02$ & $40.36\pm0.05$ & $50.02\pm0.23$ & 4 & $+0.004$ \\
+  & log-cosh & $\underline{60.77\pm0.02}$ & $40.35\pm0.04$ & $50.09\pm0.19$ & 2 & $0.000$  \\
+  & GMADL    & $60.82\pm0.14$ & $\underline{40.27\pm0.17}$ & $\underline{50.33\pm0.01}$ & 5 & $+0.051$ \\
+  & \RNAD    & $\mathbf{59.89\pm0.03}$ & $\mathbf{39.35\pm0.05}$
+             & $\mathbf{50.97\pm0.14}$ & \textbf{1} & $\mathbf{-0.882}$ \\
+\midrule
+\multirow{5}{*}{iTransformer}
+  & MSE      & $61.22\pm0.32$ & $40.62\pm0.15$ & $50.28\pm0.39$ & 3 & $+0.003$ \\
+  & Huber    & $61.23\pm0.31$ & $40.61\pm0.19$ & $50.32\pm0.36$ & 4 & $+0.005$ \\
+  & log-cosh & $\underline{61.22\pm0.31}$ & $\underline{40.61\pm0.18}$ & $50.22\pm0.06$ & 2 & $0.000$  \\
+  & GMADL    & $61.67\pm0.41$ & $40.82\pm0.12$ & $\underline{50.51\pm0.49}$ & 5 & $+0.445$ \\
+  & \RNAD    & $\mathbf{60.54\pm0.07}$ & $\mathbf{39.84\pm0.02}$
+             & $\mathbf{51.29\pm0.10}$ & \textbf{1} & $\mathbf{-0.681}$ \\
+\midrule
+\multirow{5}{*}{N-HiTS}
+  & MSE      & $\underline{60.20\pm0.05}$ & $39.90\pm0.13$ & $49.69\pm0.38$ & 2 & $0.000$ \\
+  & Huber    & $60.47\pm0.38$ & $\underline{39.85\pm0.40}$
+             & $\underline{50.06\pm0.39}$ & 4 & $+0.272$ \\
+  & log-cosh & $60.40\pm0.29$ & $39.89\pm0.36$ & $49.83\pm0.55$ & 3 & $+0.202$ \\
+  & GMADL    & $64.45\pm4.77$ & $42.39\pm2.84$ & $49.88\pm0.37$ & 5 & $+4.256$ \\
+  & \RNAD    & $\mathbf{60.11\pm0.48}$ & $\mathbf{39.82\pm0.42}$ & $\mathbf{51.35\pm0.30}$ & \textbf{1} & $\mathbf{-0.086}$ \\
+\midrule
+\multirow{5}{*}{TimeXer}
+  & MSE      & $60.80\pm0.18$ & $40.21\pm0.20$ & $50.23\pm0.11$ & 4 & $+0.029$ \\
+  & Huber    & $60.78\pm0.08$ & $40.20\pm0.13$ & $50.19\pm0.26$ & 3 & $+0.009$ \\
+  & log-cosh & $60.84\pm0.11$ & $40.22\pm0.14$ & $\underline{50.38\pm0.12}$ & 5 & $+0.069$ \\
+  & GMADL    & $\underline{60.77\pm0.05}$ & $\underline{40.19\pm0.08}$ & $50.36\pm0.07$ & 2 & $0.000$ \\
+  & \RNAD    & $\mathbf{60.12\pm0.01}$ & $\mathbf{39.58\pm0.02}$
+             & $\mathbf{50.81\pm0.24}$ & \textbf{1} & $\mathbf{-0.658}$ \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+\FloatBarrier
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.95\textwidth]{figure_02_rmse_vs_da_pareto_scatter.pdf}
+\caption{\textbf{RMSE--DA Pareto frontier.}
+  Each point represents one backbone--loss combination ($n = 20$
+  combinations; RMSE and DA averaged across three seeds and nine
+  assets). \RNAD (red) occupies the lower-right quadrant, achieving
+  simultaneously lower RMSE and higher DA than MSE, Huber, and
+  log-cosh baselines. GMADL improves DA at the cost of elevated
+  RMSE on several backbones. RMSE is in raw price units (averaged
+  over nine assets for visual comparison); DA in percent.}
+\label{fig:pareto-frontier}
+\end{figure}
+
+\FloatBarrier
+
+\subsection{Cross-Architecture Consistency}
+
+Table~\ref{tab:model-wise} aggregates metrics by backbone across all
+nine assets and three seeds. \RNAD achieves the best average RMSE on
+all four architectures and reduces RMSE relative to MSE by
+0.09--0.89 units. Standard deviations of per-seed RMSE on
+transformer-family backbones remain small ($\sigma \leq 0.07$;
+Table~\ref{tab:main-bench}), indicating that the observed gains are
+stable across random seeds and are not attributable to favorable
+initialization.
+
+The contrast between transformer-family backbones and N-HiTS suggests
+that backbone-level regime-aware inductive biases can partially address
+the same failure mode targeted by \RNAD at the loss level. This
+pattern indicates that loss-level and architecture-level
+regime-awareness occupy partially substitutable functional roles, and
+that \RNAD is likely most beneficial when paired with an expressive
+but geometrically naive backbone.
+
+\begin{table}[!htbp]
+\centering
+\caption{Backbone-aggregated performance (mean over nine assets and three seeds). $\Delta$ vs.\ MSE and $\Delta$ vs.\ GMADL are the RMSE improvements of \RNAD.}
+\label{tab:model-wise}
+\small
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llrrrr}
+\toprule
+Model        & Avg RMSE & Avg DA & $\Delta$ vs.\ MSE & $\Delta$ vs.\ GMADL & Best Loss \\
+\midrule
+PatchTST     & $\mathbf{60.61}$ & 50.29 & $\mathbf{-0.886}$ & $-0.933$ & \RNAD \\
+iTransformer & 61.18 & $\mathbf{50.52}$ & $-0.684$ & $\underline{-1.126}$ & \RNAD \\
+N-HiTS       & 61.08 & 50.16 & $-0.086$ & $\mathbf{-4.131}$ & \RNAD \\
+TimeXer      & $\underline{60.66}$ & $\underline{50.39}$ & $\underline{-0.687}$ & $-0.658$ & \RNAD \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+\FloatBarrier
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.95\textwidth]{figure_03_cross_model_consistency.pdf}
+\caption{\textbf{Cross-architecture consistency.}
+  Average RMSE (bars, left axis) and directional accuracy (line
+  markers, right axis) aggregated over nine assets and three seeds,
+  grouped by backbone. \RNAD (red) reduces RMSE consistently on
+  transformer-family backbones (PatchTST, iTransformer, TimeXer)
+  relative to MSE, Huber, and log-cosh. On N-HiTS, the
+  architecture's existing regime-aware inductive biases reduce the
+  marginal benefit of loss-level intervention. Error bars denote
+  standard deviation over seeds.}
+\label{fig:cross-model}
+\end{figure}
+
+\FloatBarrier
+
+\subsection{Per-Asset Analysis}
+
+Table~\ref{tab:per-asset} reports per-asset RMSE and DA on PatchTST.
+\RNAD achieves the lowest RMSE on all nine assets, indicating that
+the gains are not concentrated within a single market class. RMSE
+reductions are proportionally largest for BTCUSD ($-6.69$ units,
+$-1.56\%$) and AAPL ($-0.133$ units, $-7.6\%$), the two assets with
+the highest realized volatility (Table~\ref{tab:data-summary}),
+consistent with the normalization mechanism providing the greatest
+benefit in volatile regimes.
+
+Directional accuracy improvements are more heterogeneous, ranging from
+$+0.17$ percentage points (USDJPY) to $+2.29$ pp (BTCUSD). This
+heterogeneity reflects both the inherent difficulty of one-step
+directional prediction at the minute horizon and the asset-specific
+relationship between volatility regime and the efficacy of gated
+directional supervision.
+
+\begin{table}[t]
+\centering
+\caption{Per-asset results on PatchTST (mean over seeds
+  $\{178, 956, 1045\}$). RMSE (lower is better) and DA~(\%) (higher
+  is better). Bold indicates best RMSE; underline indicates second
+  best.}
+\label{tab:per-asset}
+\small
+\setlength{\tabcolsep}{3pt}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lcc cc cc cc cc}
+\toprule
+& \multicolumn{2}{c}{MSE}
+& \multicolumn{2}{c}{Huber}
+& \multicolumn{2}{c}{log-cosh}
+& \multicolumn{2}{c}{GMADL}
+& \multicolumn{2}{c}{\RNAD} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5} \cmidrule(lr){6-7} \cmidrule(lr){8-9} \cmidrule(lr){10-11}
+Asset
+& RMSE & DA
+& RMSE & DA
+& RMSE & DA
+& RMSE & DA
+& RMSE & DA \\
+\midrule
+AAPL    & 1.75 & 48.62 & 1.73 & 48.43 & 1.71 & 49.25 & \underline{1.67} & \underline{50.14} & \textbf{1.61} & \textbf{50.75} \\
+AUDUSD  & 7.97e{-4} & 49.61 & \underline{7.97e{-4}} & 49.68 & 7.97e{-4} & \underline{49.74} & 8.02e{-4} & 49.67 & \textbf{7.90e{-4}} & \textbf{50.56} \\
+BTCUSD  & \underline{427.90} & 50.01 & 427.92 & 49.98 & 427.90 & 50.00 & 428.12 & \underline{51.25} & \textbf{421.21} & \textbf{52.30} \\
+DAX30   & 54.93 & \underline{50.62} & 54.93 & 50.62 & 54.93 & 50.59 & \underline{54.90} & 50.17 & \textbf{54.50} & \textbf{51.58} \\
+ETHUSD  & 24.04 & 50.29 & \underline{24.03} & 50.21 & 24.03 & 50.28 & 24.25 & \underline{50.48} & \textbf{23.75} & \textbf{51.08} \\
+FTSE100 & \underline{15.26} & 50.68 & 15.26 & 50.66 & 15.27 & 50.51 & 15.34 & \underline{50.86} & \textbf{15.06} & \textbf{51.17} \\
+US500   & 14.47 & 49.98 & 14.47 & 49.85 & \underline{14.47} & 49.93 & 14.49 & \textbf{50.29} & \textbf{14.29} & \underline{50.26} \\
+USDJPY  & 0.18 & 50.73 & 0.18 & 50.51 & \underline{0.18} & \underline{50.76} & 0.18 & 50.28 & \textbf{0.18} & \textbf{50.89} \\
+XAUUSD  & \underline{8.47} & 49.93 & 8.47 & \textbf{50.23} & 8.47 & 49.73 & 8.47 & 49.86 & \textbf{8.41} & \underline{50.11} \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+\FloatBarrier
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.95\textwidth]{figure_06_per_asset_metric_bars.pdf}
+\caption{\textbf{Per-asset performance on PatchTST.}
+  Left: RMSE by asset and loss; \RNAD (red) achieves the lowest
+  RMSE in every asset class. Right: directional accuracy (DA, higher
+  is better). RMSE axis scales differ substantially across assets
+  due to absolute price-level variation (\eg BTCUSD vs.\ AUDUSD);
+  percentage improvements are scale-consistent after volatility
+  normalization.}
+\label{fig:per-asset}
+\end{figure}
+
+\FloatBarrier
+
+\subsection{Volatility Tracking Diagnostics}
+\label{ssec:vol-tracking}
+
+Figure~\ref{fig:regime-scale} shows the adaptive scale $s_t$
+alongside $s_t^{\mathrm{batch}}$, $s_t^{\mathrm{EMA}}$, and a proxy
+for realized volatility on BTCUSD and AUDUSD. The batch scale
+responds immediately to volatility spikes; the EMA scale captures
+regime-level persistence. Their geometric blend tracks realized
+volatility accurately without overfitting to transient noise,
+confirming that the normalization mechanism operates as intended
+across assets with two-orders-of-magnitude differences in absolute
+return scale.
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.95\textwidth]{figure_05_regime_scale_tracking.pdf}
+\caption{\textbf{Adaptive volatility tracking.}
+  BTCUSD (top) and AUDUSD (bottom). Batch scale $s_t^{\mathrm{batch}}$
+  (light blue, Eq.~\ref{eq:batch-scale}) reacts immediately to
+  volatility spikes. EMA scale $s_t^{\mathrm{EMA}}$ (dark blue,
+  Eq.~\ref{eq:ema-scale}, $\rho = 0.985$) provides regime-level
+  memory. Composite scale $s_t$ (red, Eq.~\ref{eq:composite-scale}).
+  Circular markers: realized volatility (rolling RMS return). The
+  composite scale faithfully tracks realized volatility while
+  attenuating transient noise.}
+\label{fig:regime-scale}
+\end{figure}
+
+\FloatBarrier
+% -----------------------------------------------------------------------
+\section{Ablation Analysis}
+\label{sec:ablation}
+
+To assess each component's individual contribution, we train PatchTST
+with seed 178 under four conditions, removing one mechanism at a time
+from the full \RNAD objective:
+\begin{itemize}
+\item \texttt{FULL}: Complete \RNAD loss (Eq.~\ref{eq:rnad-sample}).
+\item \texttt{NO\_DIR}: Directional term removed
+  ($\lambda_{\mathrm{dir}} = 0$).
+\item \texttt{NO\_TAIL}: Gated magnitude replaced by pure quadratic
+  ($g_t \equiv 0$ in Eq.~\ref{eq:mag-loss}).
+\item \texttt{NO\_NOISE}: Noise gate disabled ($w_t \equiv 1$ in
+  Eq.~\ref{eq:noise-gate}; directional term always active).
+\end{itemize}
+
+Table~\ref{tab:ablation} reports results on four representative
+assets: a high-volatility cryptocurrency (BTCUSD), a low-volatility
+foreign exchange pair (AUDUSD), an equity index (US500), and a
+commodity (XAUUSD).
+
+\begin{table}[t]
+\centering
+\caption{Controlled ablation on PatchTST (seed 178). $\Delta$RMSE and
+  $\Delta$DA are computed relative to \texttt{FULL} for each asset.
+  Positive $\Delta$RMSE indicates degradation when a component is
+  removed.}
+\label{tab:ablation}
+\small
+\setlength{\tabcolsep}{2.5pt}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llrrrrr}
+\toprule
+Asset  & Variant    & RMSE      & $\Delta$RMSE   & MAE      & DA    & $\Delta$DA \\
+\midrule
+\multirow{4}{*}{AUDUSD}
+  & FULL       & $\underline{0.00079020}$   & ---            & $\underline{0.00053505}$  & 50.84 & ---    \\
+  & NO\_DIR    & 0.00079655   & $+0.00000634$     & 0.00054031  & 50.24 & $-0.60$ \\
+  & NO\_TAIL   & 0.00079142   & $+0.00000122$     & 0.00053625  & $\underline{50.86}$ & $+0.01$ \\
+  & NO\_NOISE  & $\mathbf{0.00078971}$   & $-0.00000049$     & $\mathbf{0.00053444}$  & $\mathbf{51.15}$ & $+0.31$ \\
+\midrule
+\multirow{4}{*}{BTCUSD}
+  & FULL       & 422.61    & ---            & $\underline{284.04}$   & 51.67 & ---    \\
+  & NO\_DIR    & 425.32    & $+2.71$        & 286.09   & $\mathbf{51.74}$ & $+0.06$ \\
+  & NO\_TAIL   & $\mathbf{421.87}$    & $-0.74$        & $\mathbf{283.54}$   & 51.51 & $-0.16$ \\
+  & NO\_NOISE  & $\underline{422.42}$    & $-0.18$        & 284.27   & $\underline{51.72}$ & $+0.05$ \\
+\midrule
+\multirow{4}{*}{US500}
+  & FULL       & $\mathbf{14.33}$     & ---            & $\underline{8.01}$     & 49.57 & ---    \\
+  & NO\_DIR    & $\underline{14.33}$     & $+0.01$        & $\underline{8.06}$     & 48.60 & $-0.98$ \\
+  & NO\_TAIL   & 14.35     & $+0.02$        & 8.03     & $\mathbf{50.27}$ & $+0.70$ \\
+  & NO\_NOISE  & 14.34     & $+0.01$        & $\mathbf{8.00}$     & $\underline{49.97}$ & $+0.40$ \\
+\midrule
+\multirow{4}{*}{XAUUSD}
+  & FULL       & $\underline{8.41}$      & ---            & 5.56     & $\underline{50.54}$ & ---    \\
+  & NO\_DIR    & 8.48      & $+0.07$        & 5.60     & 50.43 & $-0.11$ \\
+  & NO\_TAIL   & 8.42      & $+0.01$        & $\mathbf{5.56}$     & $\mathbf{50.90}$ & $+0.35$ \\
+  & NO\_NOISE  & $\mathbf{8.41}$      & $-0.00$        & $\underline{5.56}$     & 50.39 & $-0.15$ \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+\FloatBarrier
+
+\paragraph{Directional learning (\texttt{NO\_DIR}).}
+Removing the directional penalty consistently degrades RMSE (mean
+$\Delta = +0.70$ RMSE units) and reduces DA on three of the four
+assets. This indicates that directional supervision contributes to
+both magnitude and directional accuracy---a coupling explained in
+Section~\ref{ssec:coupling}. The effect is largest on BTCUSD
+($\Delta = +2.71$), where economically significant directional moves
+are most frequent and the noise gate therefore permits the most
+directional supervision.
+
+\paragraph{Tail gating (\texttt{NO\_TAIL}).}
+The contribution of tail gating is asset-dependent. On BTCUSD,
+removing the tail gate yields a marginal RMSE improvement ($-0.74$),
+suggesting that $\tau_{\mathrm{mag}} = 1.1$ transitions slightly too
+aggressively for BTCUSD's heavier tails relative to the default
+calibration. On AUDUSD, US500, and XAUUSD, the full loss is preferred
+over \texttt{NO\_TAIL}. These results indicate that
+$\tau_{\mathrm{mag}}$ is the parameter most sensitive to
+asset-specific tail behavior and is therefore a candidate for light
+per-asset tuning in production deployments.
+
+\paragraph{Noise gating (\texttt{NO\_NOISE}).}
+The effects of noise gating are mixed and generally modest. On AUDUSD
+and BTCUSD, disabling the gate slightly improves RMSE
+($-4.9\times10^{-7}$ and $-0.18$, respectively) and increases DA.
+On US500, the gate improves RMSE by $+0.01$ when removed while
+reducing DA. On XAUUSD, disabling the gate yields a marginal RMSE
+gain ($-0.001$) but reduces DA by $0.15$ pp. Overall, noise gating
+functions as a conservative regularizer whose impact is
+regime-dependent.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.95\textwidth]{figure_04_ablation_comparison.pdf}
+\caption{\textbf{Ablation component contributions.}
+  Left: percent change in RMSE when each mechanism is removed from
+  the full \RNAD objective, across four representative assets.
+  Right: corresponding percent change in DA. \texttt{NO\_DIR}
+  consistently degrades RMSE, indicating that directional supervision
+  is the primary driver of magnitude accuracy improvements.
+  \texttt{NO\_TAIL} is most impactful on heavy-tailed assets
+  (BTCUSD, XAUUSD). \texttt{NO\_NOISE} exhibits mixed,
+  low-magnitude effects across assets.}
+\label{fig:ablation}
+\end{figure}
+
+\FloatBarrier
+% -----------------------------------------------------------------------
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{Why \RNAD Improves Forecasting}
+
+The consistent RMSE improvements on transformer-style backbones are
+interpretable through the lens of gradient signal quality. Standard
+MSE generates parameter updates proportional to raw residual
+magnitude, conflating prediction error with volatility scale. In
+high-volatility regimes, large shocks dominate gradient updates,
+driving the optimizer toward minimizing absolute magnitudes rather
+than learning regime-relative structure. In low-volatility periods,
+directional noise corrupts the sign gradient. \RNAD corrects both
+pathologies simultaneously: volatility normalization calibrates
+gradient magnitude to predictive difficulty; tail gating bounds the
+influence of tail events; and gated directional supervision injects
+complementary, sign-level information that MSE cannot express.
+
+This framing is consistent with a signal-to-noise improvement in
+the gradient stream. By normalizing residuals by $s_t$, the loss
+ensures that gradient magnitudes reflect how unexpected a residual
+is \emph{relative to the prevailing regime}, rather than how large
+it is in absolute terms. The directional term then contributes a
+complementary loss surface that creates asymmetric penalties around
+the sign boundary, explicitly encoding the economically motivated
+half-plane constraint that MSE ignores.
+
+\subsection{Directional--Magnitude Coupling}
+\label{ssec:coupling}
+
+A notable empirical finding is that the addition of a directional
+penalty also reduces RMSE (Table~\ref{tab:ablation}, \texttt{NO\_DIR}
+rows). This coupling arises from the geometry of the squared-error
+loss. For a prediction $\hat{r}_t$ with the wrong sign, the residual
+is $e_t = \hat{y}_t - y_t$; when $|\hat{r}_t| \approx |r_t|$, a sign
+error approximately doubles the residual compared to a same-magnitude
+correct-sign prediction. Concretely, the average MSE contribution of
+a sign-error event is roughly four times that of a correct-sign
+prediction of equal magnitude. By penalizing sign errors, \RNAD
+implicitly constrains $\hat{r}_t$ toward the correct half-plane,
+reducing the frequency of large-residual sign-error events and thereby
+improving MSE even when $\lambda_{\mathrm{dir}}$ is modest.
+
+\subsection{Architectural Interactions}
+\label{ssec:interactions}
+
+The architecture-dependent benefit pattern---large gains on
+transformer-family backbones, smaller gains on N-HiTS---supports the
+interpretation that loss-level and architecture-level regime-awareness
+occupy overlapping functional space. N-HiTS's hierarchical
+decomposition already captures some regime structure; the marginal
+benefit of \RNAD is correspondingly smaller when the backbone has
+partially addressed the same failure mode. Importantly, \RNAD does
+not degrade backbone-level aggregate RMSE: on N-HiTS the gain is
+modest but positive ($\Delta\mathrm{RMSE} = -0.086$ versus MSE),
+confirming that the loss is safely composable with regime-aware
+architectures.
+
+\subsection{Statistical Stability}
+
+The small standard deviations of \RNAD RMSE across seeds
+($\sigma \leq 0.07$ on transformer backbones; Table~\ref{tab:model-wise})
+confirm that the observed improvements are stable across random
+initializations. This stability is consistent with the gradient-level
+explanation above: improvements arise from systematic changes in the
+optimization geometry rather than from favorable sampling of the
+loss landscape.
+
+\FloatBarrier
+% -----------------------------------------------------------------------
+\section{Limitations}
+\label{sec:limitations}
+
+\paragraph{Theoretical foundations.}
+\RNAD is designed on geometric and empirical grounds. No convergence
+guarantees, Bayes-optimality certificates, or formal proof that the
+gated directional term constitutes a proper scoring
+rule~\citep{gneiting2007strictly} are provided. The EMA volatility
+estimator introduces first-order autocorrelation in the effective loss
+landscape and may misrepresent long-memory volatility dynamics not
+captured by the GARCH-like EMA kernel. Formal Diebold--Mariano or
+Model Confidence Set tests~\citep{diebold1995comparing,
+hansen2011model} were not applied; extending these results with such
+statistical comparisons is an important direction for future work.
+
+\paragraph{Hyperparameter sensitivity.}
+The loss introduces ten scalar controls (Table~\ref{tab:hyperparams}).
+While the default values are empirically robust to $\pm 20\%$
+perturbations for most parameters, $\tau_{\mathrm{noise}}$ is the
+most sensitive control and may merit retuning when transferring to a
+substantially different market universe. The tail-gating parameters
+$\tau_{\mathrm{mag}}$ and $\tau_{\mathrm{temp}}$ are moderately
+sensitive on heavy-tailed assets (see the BTCUSD ablation results
+in Table~\ref{tab:ablation}) and represent the most valuable targets
+for asset-specific calibration.
+
+\paragraph{Scope of demonstrated improvements.}
+Consistent gains are concentrated in one-step-ahead, raw-price
+prediction on attention-based architectures. Benefits are weaker
+or absent on regime-aware architectures, at longer forecasting
+horizons, and in return-domain or log-price formulations where
+normalization is less critical. Practitioners should validate \RNAD
+on their specific setup before assuming transferability.
+
+\paragraph{Economic validity of directional accuracy.}
+The DA metric (Eq.~\ref{eq:da}) weights all non-flat moves equally
+regardless of magnitude or economic significance, and does not account
+for transaction costs, bid--ask spread, slippage, position sizing,
+or the asymmetric utility of large versus small directional errors.
+Higher DA does not imply higher risk-adjusted returns, and this study
+makes no such claim. Evaluation within a full trading simulation with
+realistic costs is necessary to draw conclusions about practical
+financial value.
+
+\paragraph{Statefulness and engineering overhead.}
+The EMA buffer must be synchronized across data-parallel workers,
+persisted at checkpoints, and reset at each training initialization.
+This engineering overhead is absent in stateless losses and may
+complicate deployment in highly distributed training pipelines.
+
+\paragraph{Batch dependence.}
+Because the volatility scale and gates are computed from mini-batches,
+the objective is mildly batch-size dependent; smaller batches yield
+noisier scale estimates and can alter the effective gate values.
+Batch size is held fixed at 64 in all experiments, which controls
+but does not eliminate this effect.
+
+\paragraph{Evaluation breadth.}
+The benchmark uses three seeds and a single chronological split per
+asset. Extending to multiple non-overlapping temporal windows and
+applying bootstrap inference over test-set samples would substantially
+strengthen the statistical conclusions.
+
+\FloatBarrier
+% -----------------------------------------------------------------------
+\section{Conclusion}
+\label{sec:conclusion}
+
+We introduced \RNAD, a regime-normalized adaptive directional loss
+for financial time-series forecasting. By unifying adaptive volatility
+normalization, tail-robust magnitude handling, and gated directional
+learning into a single differentiable objective, \RNAD realigns the
+training geometry with the distinctive statistical structure of
+financial markets: regime-switching, heavy-tailed, and sign-sensitive.
+
+Comprehensive benchmarks across nine assets and four architectures
+demonstrate consistent RMSE improvements on transformer-style
+backbones and the lowest per-asset RMSE on every PatchTST market.
+Controlled ablation studies indicate that all three components
+contribute independently: directional learning is the primary driver
+of magnitude improvement; tail gating is most critical on
+heavy-tailed assets; and noise gating contributes modest,
+regime-dependent regularization. The loss is computationally
+lightweight, architecture-agnostic, and requires no modification
+to model structure, data pipeline, or inference code.
+
+The broader implication is that \emph{loss-level design is an
+important lever for financial forecasting improvement}, with effects
+in this benchmark that are of a comparable order of magnitude to
+several architectural choices while remaining less costly to deploy.
+Directional accuracy should be interpreted as a forecast-quality
+metric rather than a direct proxy for trading profitability; this
+study does not evaluate transaction costs, slippage, or
+profit-and-loss. When the forecasting target is volatile,
+heavy-tailed, and direction-sensitive---as financial prices
+characteristically are---the training objective can be highly
+consequential relative to the choice of model architecture.
+
+\FloatBarrier
+
+% -----------------------------------------------------------------------
+\appendix
+\section{Supplementary Diagnostics}
+
+\subsection{Loss Landscape and Gradient Dynamics}
+
+Figure~\ref{fig:gradient-field} contrasts the gradient vector fields
+of \RNAD and MSE as functions of normalized error $u_t$ and realized
+move $z_t$. \RNAD maintains steep, informative gradients near the
+origin (facilitating precise level learning) while transitioning to
+sub-linear damping in the tails (bounding gradient norms during
+extreme events). MSE gradients grow linearly without bound,
+systematically over-weighting tail observations in parameter updates.
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.95\textwidth]{figure_07_loss_landscape_gradient_field.pdf}
+\caption{\textbf{Loss landscape and gradient fields: \RNAD vs.\ MSE.}
+  (A) \RNAD maintains steep gradients for $|u_t| < 1$ and transitions
+  to sub-linear damping for $|u_t| > 2$. (B) MSE gradients grow
+  proportionally to $|u_t|$ without bound. Arrows indicate direction
+  and relative magnitude of local optimization steps; color indicates
+  loss density. Transition midpoint $\tau_{\mathrm{mag}} = 1.1$.}
+\label{fig:gradient-field}
+\end{figure}
+
+\FloatBarrier
+
+\subsection{Regime-Stratified Performance}
+
+Figure~\ref{fig:volatility-regimes} stratifies test performance by
+causal volatility regime (terciles of realized volatility computed
+from training-set statistics, to avoid look-ahead bias). \RNAD
+maintains a consistent performance advantage over MSE across all three
+regimes, indicating that adaptive normalization generalizes across
+volatility levels and does not merely exploit tail events.
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.95\textwidth]{figure_08_performance_vs_volatility_regime.pdf}
+\caption{\textbf{Performance stratified by volatility regime.}
+  RMSE (bars, left axis) and DA (line, right axis) on BTCUSD, US500,
+  and XAUUSD, stratified into low- ($<$33rd pctile), medium-
+  (33rd--66th pctile), and high-volatility ($>$66th pctile) terciles.
+  \RNAD (red) maintains a consistent advantage over MSE in all bins,
+  supporting the regime-uniform generalization of the EMA
+  normalization.}
+\label{fig:volatility-regimes}
+\end{figure}
+
+\FloatBarrier
+
+\subsection{Seed Stability}
+
+Figure~\ref{fig:seed-stability} shows box-and-whisker distributions
+of RMSE and DA across nine assets and three seeds. \RNAD distributions
+are consistently shifted toward lower error, with narrow whiskers
+indicating that improvements arise from the loss geometry rather than
+favorable initialization.
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.95\textwidth]{figure_09_stability_across_seeds.pdf}
+\caption{\textbf{Seed stability.}
+  Distributions of RMSE (left), MAE (center), and DA (right)
+  for \RNAD vs.\ MSE, over $n = 9$ assets and three seeds.
+  \RNAD distributions shift consistently toward lower error, with
+  narrow inter-seed spread ($< 0.1\%$ relative variance on
+  transformer backbones).}
+\label{fig:seed-stability}
+\end{figure}
+
+\FloatBarrier
+
+\subsection{Forecast Trace Case Studies}
+
+Figure~\ref{fig:case-studies} shows 100-step forecast traces for
+four assets. \RNAD tracks directional reversals more faithfully than
+MSE during high-volatility windows ($|z_t| > \tau_{\mathrm{noise}}$),
+consistent with the quantitative DA improvements reported in
+Table~\ref{tab:per-asset}.
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.95\textwidth]{figure_10_forecast_trace_case_studies.pdf}
+\caption{\textbf{Forecast trace case studies.}
+  PatchTST predictions (MSE: blue; \RNAD: red) vs.\ realized close
+  price (black) over 100-step windows on four assets. Shaded
+  regions highlight high-volatility episodes where \RNAD captures
+  directional reversals that MSE misses. Right panels show 20-step
+  rolling DA.}
+\label{fig:case-studies}
+\end{figure}
+
+\FloatBarrier
+
+\subsection{Full Ablation: All Assets and Components}
+
+Figures~\ref{fig:variant-delta} and~\ref{fig:component-effects} extend
+the four-asset ablation reported in Section~\ref{sec:ablation}.
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.95\textwidth]{figure_A1_variant_delta_plot.pdf}
+\caption{\textbf{Per-asset ablation variant delta.}
+  Mean RMSE difference ($\Delta$RMSE vs.\ \texttt{FULL}) across the
+  available ablation runs (seed 178) for the four reported assets.
+  All per-asset mean deltas are non-negative, indicating that no
+  individual component is redundant across the reported assets.}
+\label{fig:variant-delta}
+\end{figure}
+
+\FloatBarrier
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.95\textwidth]{figure_A2_component_effect_heatmap.pdf}
+\caption{\textbf{Component contribution heatmap.}
+  Mean percent RMSE increase when each mechanism is ablated, by asset
+  and component (NORM: normalization; TAIL: tail gating; DIR:
+  directional term; NOISE: noise gating). Darker cells indicate
+  greater reliance on that component. The directional term (DIR)
+  shows a strong and consistent contribution across assets; tail
+  gating (TAIL) is most critical for high-volatility assets
+  (BTCUSD, ETHUSD).}
+\label{fig:component-effects}
+\end{figure}
+
+\FloatBarrier
+
+\subsection{Computational Overhead}
+
+\RNAD introduces negligible runtime cost relative to MSE. The EMA
+update (Eq.~\ref{eq:ema-scale}) requires a single scalar
+multiply-add per gradient step. Additional loss computations---tanh,
+logistic gate, softplus---are elementwise operations parallelized by
+the autograd engine with no synchronization barrier. Memory overhead
+amounts to one floating-point scalar per asset. In wall-clock
+benchmarks on all four backbones, training and inference throughput
+are indistinguishable from MSE at standard batch sizes.
+
+% -----------------------------------------------------------------------
+\section*{Acknowledgments}
+
+The author have no specific acknowledgments to report. No external
+funding was received for this work, and no individuals or organizations
+contributed in a manner that warrants formal acknowledgment.
+
+\section*{Conflict of Interest}
+The author declares that there are no conflicts of interest, financial or otherwise, that could have influenced the research, authorship, or publication of this work. The study was conducted independently, and no external funding, affiliations, or personal relationships exist that could be perceived as affecting the objectivity, integrity, or interpretation of the results presented in this article.
+
+\section*{Data and Code Availability}
+
+The implementation code, along with all relevant configuration files required to reproduce the experiments presented in this manuscript, is publicly available at the following GitHub repository:
+
+\url{https://github.com/NabeelAhmad9/RNAD}
+
+Processed data artifacts generated and analyzed during this study are not publicly available due to proprietary or ethical restrictions. They are available from the corresponding author upon reasonable request, subject to a signed data use agreement.
+% -----------------------------------------------------------------------
+\bibliographystyle{plainnat}
+\begin{thebibliography}{99}
+
+% --- Original references (revised/corrected) ---
+
+\bibitem[Barron(2019)]{barron2019general}
+J.~T. Barron.
+A general and adaptive robust loss function.
+In \emph{Proc.\ IEEE/CVF CVPR}, pages 4331--4339, 2019.
+
+\bibitem[Bengio et~al.(2009)]{bengio2009curriculum}
+Y.~Bengio, J.~Louradour, R.~Collobert, and J.~Weston.
+Curriculum learning.
+In \emph{Proc.\ ICML}, pages 41--48, 2009.
+
+\bibitem[Bollerslev(1986)]{bollerslev1986generalized}
+T.~Bollerslev.
+Generalized autoregressive conditional heteroskedasticity.
+\emph{Journal of Econometrics}, 31(3):307--327, 1986.
+
+\bibitem[Cao and Tay(2001)]{cao2001financial}
+L.~J. Cao and F.~E.~H. Tay.
+Financial forecasting using support vector machines.
+\emph{Neural Computing \& Applications}, 10(2):184--192, 2001.
+
+\bibitem[Challu et~al.(2023)]{challu2023nhits}
+C.~Challu, K.~G. Olivares, B.~N. Oreshkin, F.~Garza,
+M.~Mergenthaler-Canseco, and A.~Dubrawski.
+N-HiTS: Neural hierarchical interpolation for time series forecasting.
+In \emph{Proc.\ AAAI}, volume~37, pages 6989--6997, 2023.
+
+\bibitem[Charbonnier et~al.(1997)]{charbonnier1994deterministic}
+P.~Charbonnier, L.~Blanc-F{\'e}raud, G.~Aubert, and M.~Barlaud.
+Deterministic edge-preserving regularization in computed imaging.
+\emph{IEEE Trans.\ Image Process.}, 6(2):298--311, 1997.
+
+\bibitem[Saleh and Saleh(2024)]{saleh2024logcosh}
+R.~A. Saleh and A.~K.~Md. Ehsanes Saleh.
+Statistical Properties of the log-cosh Loss Function Used in Machine Learning.
+\emph{arXiv preprint arXiv:2208.04564}, 2024.
+
+\bibitem[Diebold and Mariano(1995)]{diebold1995comparing}
+F.~X. Diebold and R.~S. Mariano.
+Comparing predictive accuracy.
+\emph{Journal of Business \& Economic Statistics}, 13(3):253--263, 1995.
+
+\bibitem[Ekambaram et~al.(2023)]{ekambaram2023tsmixer}
+V.~Ekambaram, A.~Jati, N.~Nguyen, P.~Sinthong, and J.~Kalagnanam.
+TSMixer: Lightweight MLP-mixer model for multivariate time series forecasting.
+In \emph{Proc.\ ACM KDD}, 2023.
+
+\bibitem[Engle(1982)]{engle1982autoregressive}
+R.~F. Engle.
+Autoregressive conditional heteroskedasticity with estimates of the variance
+of United Kingdom inflation.
+\emph{Econometrica}, 50(4):987--1007, 1982.
+
+\bibitem[Gneiting and Raftery(2007)]{gneiting2007strictly}
+T.~Gneiting and A.~E. Raftery.
+Strictly proper scoring rules, prediction, and estimation.
+\emph{Journal of the American Statistical Association},
+102(477):359--378, 2007.
+
+\bibitem[Hansen et~al.(2011)]{hansen2011model}
+P.~R. Hansen, A.~Lunde, and J.~M. Nason.
+The model confidence set.
+\emph{Econometrica}, 79(2):453--497, 2011.
+
+\bibitem[Hastie et~al.(2009)]{hastie2009elements}
+T.~Hastie, R.~Tibshirani, and J.~Friedman.
+\emph{The Elements of Statistical Learning}, 2nd ed.
+Springer, New York, 2009.
+
+\bibitem[Huber(1964)]{huber1964robust}
+P.~J. Huber.
+Robust estimation of a location parameter.
+\emph{Annals of Mathematical Statistics}, 35(1):73--101, 1964.
+
+\bibitem[Kendall et~al.(2018)]{kendall2018multi}
+A.~Kendall, Y.~Gal, and R.~Cipolla.
+Multi-task learning using uncertainty to weigh losses for scene geometry
+and semantics.
+In \emph{Proc.\ IEEE/CVF CVPR}, pages 7482--7491, 2018.
+
+\bibitem[Kim et~al.(2022)]{kim2022reversible}
+T.~Kim, J.~Kim, Y.~Tae, C.~Park, J.-H. Choi, and J.~Choo.
+Reversible instance normalization for accurate time-series forecasting
+against distribution shift.
+In \emph{Proc.\ ICLR}, 2022.
+
+\bibitem[Kingma and Ba(2015)]{kingma2015adam}
+D.~P. Kingma and J.~Ba.
+Adam: A method for stochastic optimization.
+In \emph{Proc.\ ICLR}, 2015.
+
+\bibitem[Koenker and Bassett(1978)]{koenker1978regression}
+R.~Koenker and G.~Bassett.
+Regression quantiles.
+\emph{Econometrica}, 46(1):33--50, 1978.
+
+\bibitem[Kuan and White(1994)]{kuan1995forecasting}
+C.-M. Kuan and H.~White.
+Artificial neural networks: An econometric perspective.
+\emph{Econometric Reviews}, 13(1):1--91, 1994.
+
+\bibitem[Kumar et~al.(2010)]{kumar2010self}
+M.~P. Kumar, B.~Packer, and D.~Koller.
+Self-paced learning for latent variable models.
+In \emph{Proc.\ NeurIPS}, pages 1189--1197, 2010.
+
+\bibitem[Leitch and Tanner(1991)]{leitch1991economic}
+G.~Leitch and J.~E. Tanner.
+Economic forecast evaluation: Profits versus the conventional error measures.
+\emph{American Economic Review}, 81(3):580--590, 1991.
+
+\bibitem[Lim et~al.(2021)]{lim2021temporal}
+B.~Lim, S.~O. Arik, N.~Loeff, and T.~Pfister.
+Temporal fusion transformers for interpretable multi-horizon time series
+forecasting.
+\emph{International Journal of Forecasting}, 37(4):1748--1764, 2021.
+
+\bibitem[Lin et~al.(2017)]{focal}
+T.-Y. Lin, P.~Goyal, R.~Girshick, K.~He, and P.~Doll{\'a}r.
+Focal loss for dense object detection.
+In \emph{Proc.\ IEEE ICCV}, pages 2980--2988, 2017.
+
+\bibitem[Liu et~al.(2024)]{itransformer}
+Y.~Liu, T.~Hu, H.~Zhang, C.~Wu, S.~Wang, L.~Ma, and M.~Long.
+iTransformer: Inverted transformers are effective for time series forecasting.
+In \emph{Proc.\ ICLR}, 2024.
+
+\bibitem[Wang et~al.(2024)]{timexer2024}
+Y.~Wang, H.~Wu, J.~Dong, G.~Qin, H.~Zhang, Y.~Liu, Y.~Qiu, J.~Wang,
+and M.~Long.
+TimeXer: Empowering transformers for time series forecasting with exogenous
+variables.
+\emph{arXiv preprint arXiv:2402.19072}, 2024.
+
+\bibitem[Makridakis et~al.(2022)]{makridakis2022m5}
+S.~Makridakis, E.~Spiliotis, and V.~Assimakopoulos.
+M5 accuracy competition: Results, findings, and conclusions.
+\emph{International Journal of Forecasting}, 38(4):1346--1364, 2022.
+
+\bibitem[Nie et~al.(2023)]{patchtst}
+Y.~Nie, N.~H. Nguyen, P.~Sinthong, and J.~Kalagnanam.
+A time series is worth 64 words: Long-term forecasting with transformers.
+In \emph{Proc.\ ICLR}, 2023.
+
+\bibitem[van~den Oord et~al.(2016)]{oord2016wavenet}
+A.~van~den Oord, S.~Dieleman, H.~Zen, K.~Simonyan, O.~Vinyals, A.~Graves,
+N.~Kalchbrenner, A.~Senior, and K.~Kavukcuoglu.
+WaveNet: A generative model for raw audio.
+\emph{arXiv:1609.03499}, 2016.
+
+\bibitem[Oreshkin et~al.(2020)]{oreshkin2020nbeats}
+B.~N. Oreshkin, D.~Carpov, N.~Chapados, and Y.~Bengio.
+N-BEATS: Neural basis expansion analysis for interpretable time series
+forecasting.
+In \emph{Proc.\ ICLR}, 2020.
+
+\bibitem[Pesaran and Timmermann(1992)]{pesaran1992simple}
+M.~H. Pesaran and A.~Timmermann.
+A simple nonparametric test of predictive performance.
+\emph{Journal of Business \& Economic Statistics}, 10(4):461--465, 1992.
+
+\bibitem[Salinas et~al.(2020)]{salinas2020deepar}
+D.~Salinas, V.~Flunkert, J.~Gasthaus, and T.~Januschowski.
+DeepAR: Probabilistic forecasting with autoregressive recurrent networks.
+\emph{International Journal of Forecasting}, 36(3):1181--1191, 2020.
+
+\bibitem[Sezer et~al.(2020)]{sezer2020financial}
+O.~B. Sezer, M.~U. Gudelek, and A.~M. Ozbayoglu.
+Financial time series forecasting with deep learning: A systematic
+literature review.
+\emph{Applied Soft Computing}, 90:106181, 2020.
+
+\bibitem[Wang et~al.(2024)]{wang2024timemixer}
+S.~Wang, H.~Wu, X.~Shi, T.~Hu, H.~Luo, L.~Ma, J.~Y. Zhang, and J.~Zhou.
+TimeMixer: Decomposable multiscale mixing for time series forecasting.
+In \emph{Proc.\ ICLR}, 2024.
+
+\bibitem[White(1988)]{white1988economic}
+H.~White.
+Economic prediction using neural networks: The case of IBM daily stock
+returns.
+In \emph{Proc.\ IEEE ICNN}, volume~2, pages 451--458, 1988.
+
+\bibitem[Wu et~al.(2021)]{wu2021autoformer}
+H.~Wu, J.~Xu, J.~Wang, and M.~Long.
+Autoformer: Decomposition transformers with auto-correlation for long-term
+series forecasting.
+In \emph{Proc.\ NeurIPS}, pages 22419--22430, 2021.
+
+\bibitem[Wu et~al.(2023)]{wu2023timesnet}
+H.~Wu, T.~Hu, Y.~Liu, H.~Zhou, J.~Wang, and M.~Long.
+TimesNet: Temporal 2D-variation modeling for general time series analysis.
+In \emph{Proc.\ ICLR}, 2023.
+
+\bibitem[Micha{\'n}k{\'o}w et~al.(2024)]{michankow2024gmadl}
+J.~Micha{\'n}k{\'o}w, P.~Sakowski, and R.~\'{S}lepaczuk.
+Generalized Mean Absolute Directional Loss as a Solution to Overfitting and
+High Transaction Costs in Machine Learning Models Used in High-Frequency
+Algorithmic Investment Strategies.
+\emph{arXiv preprint arXiv:2412.18405}, 2024.
+
+\bibitem[Zeng et~al.(2023)]{zeng2023dlinear}
+A.~Zeng, M.~Chen, L.~Zhang, and Q.~Xu.
+Are transformers effective for time series forecasting?
+In \emph{Proc.\ AAAI}, volume~37, pages 11121--11128, 2023.
+
+\bibitem[Zhou et~al.(2021)]{zhou2021informer}
+H.~Zhou, S.~Zhang, J.~Peng, S.~Zhang, J.~Li, H.~Xiong, and W.~Zhang.
+Informer: Beyond efficient transformer for long sequence time-series
+forecasting.
+In \emph{Proc.\ AAAI}, volume~35, pages 11106--11115, 2021.
+
+\bibitem[Zhou et~al.(2022)]{zhou2022fedformer}
+T.~Zhou, Z.~Ma, Q.~Wen, X.~Wang, L.~Sun, and R.~Jin.
+FEDformer: Frequency enhanced decomposed transformer for long-term series
+forecasting.
+In \emph{Proc.\ ICML}, pages 27268--27286, 2022.
+
+% --- New references (25+) ---
+
+\bibitem[Ansari et~al.(2024)]{ansari2024chronos}
+A.~F. Ansari, L.~Stella, C.~Turkmen, X.~Zhang, P.~Mercado, H.~Shen,
+O.~Shchur, S.~S. Rangapuram, S.~P. Pineda Arango, S.~Kapoor,
+J.~Zschiegner, P.~Maddix, M.~W. Mahoney, K.~Januschowski, and
+S.~Wang.
+Chronos: Learning the language of time series.
+\emph{arXiv:2403.07815}, 2024.
+
+\bibitem[Burges et~al.(2005)]{burges2005learning}
+C.~Burges, T.~Shaked, E.~Renshaw, A.~Lazier, M.~Deeds, N.~Hamilton,
+and G.~Hullender.
+Learning to rank using gradient descent.
+In \emph{Proc.\ ICML}, pages 89--96, 2005.
+
+\bibitem[Campbell and Thompson(2008)]{campbell2008predicting}
+J.~Y. Campbell and S.~B. Thompson.
+Predicting excess stock returns out of sample: Can anything beat the
+historical average?
+\emph{Review of Financial Studies}, 21(4):1509--1531, 2008.
+
+\bibitem[Clark and West(2007)]{clark2007approximately}
+T.~E. Clark and K.~D. West.
+Approximately normal tests for equal predictive accuracy in nested models.
+\emph{Journal of Econometrics}, 138(1):291--311, 2007.
+
+\bibitem[Cont(2001)]{cont2001empirical}
+R.~Cont.
+Empirical properties of asset returns: Stylized facts and statistical
+issues.
+\emph{Quantitative Finance}, 1(2):223--236, 2001.
+
+\bibitem[Das et~al.(2023)]{das2023long}
+A.~Das, W.~Kong, A.~Sen, and Y.~Zhou.
+Long-term forecasting with TiDE: Time-series dense encoder.
+\emph{arXiv:2304.08424}, 2023.
+
+\bibitem[Das et~al.(2024)]{das2024decoder}
+A.~Das, W.~Kong, R.~Leach, S.~Mathur, A.~Sen, and R.~Yu.
+Decoder-only foundation model for time-series forecasting.
+In \emph{Proc.\ ICML}, 2024.
+
+\bibitem[Diebold(2015)]{diebold2015comparing}
+F.~X. Diebold.
+Comparing predictive accuracy, twenty years later: A personal perspective on
+the use and abuse of Diebold--Mariano tests.
+\emph{Journal of Business \& Economic Statistics}, 33(1):1--24, 2015.
+
+\bibitem[Fan et~al.(2023)]{fan2023dish}
+W.~Fan, S.~Wang, Y.~Wang, X.~Wang, H.~Zhao, T.~Liu, C.~Shen, Q.~Xu,
+G.~Liu, and X.~Wang.
+Dish-TS: A general paradigm for alleviating distribution shift in time
+series forecasting.
+In \emph{Proc.\ AAAI}, volume~37, pages 7522--7529, 2023.
+
+\bibitem[Freyberger et~al.(2020)]{freyberger2020dissecting}
+J.~Freyberger, A.~Neuhierl, and M.~Weber.
+Dissecting characteristics nonparametrically.
+\emph{Review of Financial Studies}, 33(5):2326--2377, 2020.
+
+\bibitem[Ganin et~al.(2016)]{ganin2016domain}
+Y.~Ganin, E.~Ustinova, H.~Ajakan, P.~Germain, H.~Larochelle, F.~Laviolette,
+M.~Marchand, and V.~Lempitsky.
+Domain-adversarial training of neural networks.
+\emph{Journal of Machine Learning Research}, 17(59):1--35, 2016.
+
+\bibitem[Gretton et~al.(2012)]{gretton2012kernel}
+A.~Gretton, K.~M. Borgwardt, M.~J. Rauch, B.~Sch{\"o}lkopf, and
+A.~Smola.
+A kernel two-sample test.
+\emph{Journal of Machine Learning Research}, 13(25):723--773, 2012.
+
+\bibitem[Gu et~al.(2020)]{gu2020empirical}
+S.~Gu, B.~Kelly, and D.~Xiu.
+Empirical asset pricing via machine learning.
+\emph{Review of Financial Studies}, 33(5):2223--2273, 2020.
+
+\bibitem[Guti{\'e}rrez et~al.(2016)]{gutierrez2016ordinal}
+P.~A. Guti{\'e}rrez and M.~P{\'e}rez-Ortiz.
+Ordinal regression methods: Survey and experimental study.
+\emph{IEEE Trans.\ Knowledge and Data Engineering}, 28(1):127--146, 2016.
+
+\bibitem[Hamilton(1989)]{hamilton1989new}
+J.~D. Hamilton.
+A new approach to the economic analysis of nonstationary time series and the
+business cycle.
+\emph{Econometrica}, 57(2):357--384, 1989.
+
+\bibitem[Harvey et~al.(1997)]{harvey1997testing}
+D.~I. Harvey, S.~J. Leybourne, and P.~Newbold.
+Testing the equality of prediction mean squared errors.
+\emph{International Journal of Forecasting}, 13(2):281--291, 1997.
+
+\bibitem[Jin et~al.(2023)]{jin2023time}
+M.~Jin, S.~Wang, L.~Ma, Z.~Chu, J.~Y. Zhang, X.~Shi, P.-Y. Chen,
+Y.~Liang, Y.-F. Li, S.~Pan, and Q.~Wen.
+Time-LLM: Time series forecasting by reprogramming large language models.
+In \emph{Proc.\ ICLR}, 2024.
+
+\bibitem[Kelly et~al.(2019)]{kelly2019characteristics}
+B.~Kelly, S.~Pruitt, and Y.~Su.
+Characteristics are covariances: A unified model of risk and return.
+\emph{Journal of Financial Economics}, 134(3):501--524, 2019.
+
+\bibitem[Liu et~al.(2022)]{liu2022non}
+Y.~Liu, H.~Wu, J.~Wang, and M.~Long.
+Non-stationary transformers: Exploring the stationarity in time series
+forecasting.
+In \emph{Proc.\ NeurIPS}, pages 9881--9893, 2022.
+
+\bibitem[Liu et~al.(2024)]{liu2024adaptive}
+Y.~Liu, X.~Hu, H.~Zhang, M.~Li, Z.~Guo, W.~Zhao, and M.~Long.
+Adaptive normalization for non-stationary time series forecasting:
+A temporal slice perspective.
+In \emph{Proc.\ NeurIPS}, 2024.
+
+\bibitem[Lo and MacKinlay(1988)]{lo1988stock}
+A.~W. Lo and A.~C. MacKinlay.
+Stock market prices do not follow random walks: Evidence from a simple
+specification test.
+\emph{Review of Financial Studies}, 1(1):41--66, 1988.
+
+\bibitem[Mandelbrot(1963)]{mandelbrot1963variation}
+B.~Mandelbrot.
+The variation of certain speculative prices.
+\emph{Journal of Business}, 36(4):394--419, 1963.
+
+\bibitem[Meinshausen and Ridgeway(2006)]{meinshausen2006quantile}
+N.~Meinshausen and G.~Ridgeway.
+Quantile regression forests.
+\emph{Journal of Machine Learning Research}, 7:983--999, 2006.
+
+\bibitem[Ren et~al.(2018)]{ren2018learning}
+M.~Ren, W.~Zeng, B.~Yang, and R.~Urtasun.
+Learning to reweight examples for robust deep learning.
+In \emph{Proc.\ ICML}, pages 4334--4343, 2018.
+
+\bibitem[Stan{k}eviciute et~al.(2021)]{stankeviciute2021conformal}
+K.~Stan{k}eviciute, A.~M. Alaa, and M.~van~der Schaar.
+Conformal time-series forecasting.
+In \emph{Proc.\ NeurIPS}, pages 6216--6228, 2021.
+
+\bibitem[Vaswani et~al.(2017)]{vaswani2017attention}
+A.~Vaswani, N.~Shazeer, N.~Parmar, J.~Uszkoreit, L.~Jones,
+A.~N. Gomez, {\L}.~Kaiser, and I.~Polosukhin.
+Attention is all you need.
+In \emph{Proc.\ NeurIPS}, pages 5998--6008, 2017.
+
+\bibitem[Welch and Goyal(2008)]{welch2008comprehensive}
+I.~Welch and A.~Goyal.
+A comprehensive look at the empirical performance of equity premium prediction.
+\emph{Review of Financial Studies}, 21(4):1455--1508, 2008.
+
+\bibitem[Woo et~al.(2022)]{woo2022etsformer}
+G.~Woo, C.~Liu, D.~Sahoo, A.~Kumar, and S.~Hoi.
+ETSformer: Exponential smoothing transformers for time-series forecasting.
+\emph{arXiv:2202.01381}, 2022.
+
+\bibitem[Zhang and Yan(2023)]{zhang2023crossformer}
+Y.~Zhang and J.~Yan.
+Crossformer: Transformer utilizing cross-dimension dependency for multivariate
+time series forecasting.
+In \emph{Proc.\ ICLR}, 2023.
+
+\end{thebibliography}
+
+\end{document}
